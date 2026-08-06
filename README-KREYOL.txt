@@ -1,24 +1,43 @@
-DLM WALLET AUTH BACKEND
+DLM WALLET MONGO BACKEND
 
-Sa pake sa a fè:
-- Kreye kont kliyan nan PostgreSQL.
-- Chifre modpas ak bcryptjs.
-- Login ak JWT.
-- Wòl customer/admin.
-- fastpayhaiti@gmail.com vin admin otomatikman.
-- Chak kliyan gen pwòp balans pa li.
-- Sèl admin ka ajiste balans kliyan.
+Kisa pake a genyen:
+- server.js
+- package.json
+- ENV-EXAMPLE.txt
+- README-KREYOL.txt
 
-ENPÒTAN:
-1. Mete fichye backend yo nan sèvis Render backend ou a.
-2. Kreye yon PostgreSQL database.
-3. Egzekite schema.sql nan database la.
-4. Mete environment variables ki nan .env.example sou Render.
-5. Nan public-js/auth-api.js, ranplase:
-   https://YOUR-RENDER-SERVICE.onrender.com
-   ak URL backend Render pa ou.
-6. Mete auth-api.js nan repo frontend GitHub la.
-7. Login/register HTML yo dwe rele fonksyon loginDlmUser ak registerDlmUser.
+Sa backend la fè:
+- Register kliyan
+- Login kliyan
+- JWT token
+- Admin apa ak email fastpayhaiti@gmail.com
+- Chak kliyan gen pwòp balans li
+- Withdraw
+- Transfer ant kliyan
+- Lis tranzaksyon
+- Admin ka wè tout kliyan
+- Admin ka ajoute oswa retire balans
+- Admin ka bloke oswa aktive yon kont
 
-Pa mete DATABASE_URL oswa JWT_SECRET nan GitHub piblik.
-Pa mete modpas admin nan kòd la.
+Kijan pou mete sou GitHub:
+1. Ale nan repo Fastpay-backend.
+2. Louvri server.js.
+3. Peze Edit.
+4. Efase tout ansyen kòd la.
+5. Kole tout kòd nouvo server.js la.
+6. Commit directly to main.
+
+Apre sa:
+1. Louvri package.json.
+2. Peze Edit.
+3. Efase tout ansyen kòd la.
+4. Kole nouvo package.json la.
+5. Commit directly to main.
+
+Sou Render mete Environment Variables:
+- MONGO_URI
+- JWT_SECRET
+- FRONTEND_ORIGIN=https://dlmwallet.com
+- ADMIN_EMAIL=fastpayhaiti@gmail.com
+
+Pa mete vrè MONGO_URI oswa JWT_SECRET nan GitHub piblik.
