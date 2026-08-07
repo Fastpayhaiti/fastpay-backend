@@ -62,9 +62,25 @@ const userSchema = new mongoose.Schema(
       default: "customer"
     },
     status: {
-      type: String,
-      enum: ["Active", "Blocked"],
-      default: "Active"
+  type: String,
+  enum: ["Active", "Blocked"],
+  default: "Active"
+},
+
+pinHash: {
+  type: String,
+  default: null
+},
+
+pinEnabled: {
+  type: Boolean,
+  default: false
+},
+
+pinUpdatedAt: {
+  type: Date,
+  default: null
+}
     }
   },
   { timestamps: true }
