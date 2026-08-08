@@ -1117,11 +1117,891 @@ balance: Number(user.balance)
   });
 }
 });
+/* =========================
+   TRANSFER
+========================= */
+
+app.post(
+  "/transfer",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const amount = Number(req.body.amount);
+
+      const recipientEmail = normalizeEmail(
+        req.body.recipientEmail
+      );
+
+      if (
+        !recipientEmail ||
+        !Number.isFinite(amount) ||
+        amount <= 0
+      ) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Imel moun k ap resevwa a ak montan valab obligatwa."
+        });
+      }
+
+      if (
+        recipientEmail ===
+        normalizeEmail(req.user.email)
+      ) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Ou pa ka transfere sou pwòp kont ou."
+        });
+      }
+
+      const sender =
+        await User.findOneAndUpdate(
+          {
+            _id: req.user.userId,
+            balance: {
+              $gte: amount
+            },
+            status: "Active"
+          },
+          {
+            $inc: {
+              balance: -amount
+            }
+          },
+          {
+            new: true
+          }
+        );
+
+      if (!sender) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Balans pa sifi oswa kont lan pa aktif."
+        });
+      }
+
+      const recipient =
+        await User.findOneAndUpdate(
+          {
+            email: recipientEmail,
+            status: "Active"
+          },
+          {
+            $inc: {
+              balance: amount
+            }
+          },
+          {
+            new: true
+          }
+        );
+
+      if (!recipient) {
+        await User.findByIdAndUpdate(
+          sender._id,
+          {
+            $inc: {
+              balance: amount
+            }
+          }
+        );
+
+        return res.status(404).json({
+          success: false,
+          message:
+            "Kont k ap resevwa a pa jwenn."
+        });
+      }
+
+      await Transaction.create([
+        {
+          userId: sender._id,
+          type: "transfer",
+          amount,
+          status: "completed",
+          description:
+            `Voye bay ${recipient.email}`
+        },
+        {
+          userId: recipient._id,
+          type: "deposit",
+          amount,
+          status: "completed",
+          description:
+            `Resevwa nan men ${sender.email}`
+        }
+      ]);
+
+      return res.json({
+        success: true,
+        message:
+          "Transfè a fèt avèk siksè.",
+        balance:
+          Number(sender.balance)
+      });
+
+    } catch (error) {
+      console.error(
+        "TRANSFER_ERROR:",
+        error
+      );
+
+      return res.status(500).json({
+        success: false,
+        message:
+          "Sèvè a pa rive fè transfè a."
+      });
+    }
+  }
+);
+
+
+/* =========================
+   TRANSACTIONS
+========================= */
+
+app.get(
+  "/transactions",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const transactions =
+        await Transaction.find({
+          userId: req.user.userId
+        }).sort({
+          createdAt: -1
+        });
+
+      return res.json({
+        success: true,
+        transactions
+      });
+
+    } catch (error) {
+      console.error(
+        "TRANSACTIONS_ERROR:",
+        error
+      );
+
+      return res.status(500).json({
+        success: false,
+        message:
+          "Pa rive chaje tranzaksyon yo."
+      });
+    }
+  }
+);
+
+
+/* =========================
+   ADMIN USERS
+========================= */
+
+app.get(
+  "/admin/users",
+  requireAuth,
+  requireAdmin,
+  async (_req, res) => {
+    try {
+      const users =
+        await User.find()
+          .select(
+            "-password -pinHash"
+          )
+          .sort({
+            createdAt: -1
+          });
+
+      return res.json({
+        success: true,
+        users:
+          users.map(publicUser)
+      });
+
+    } catch (error) {
+      console.error(
+        "ADMIN_USERS_ERROR:",
+        error
+      );
+
+      return res.status(500).json({
+        success: false,
+        message:
+          "Pa rive chaje kliyan yo."
+      });
+    }
+  }
+);
+
+
+/* =========================
+   ADMIN DEPOSITS
+========================= */
+
+app.get(
+  "/admin/deposits",
+  requireAuth,
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const status = String(
+        req.query.status || ""
+      ).trim();
+
+      const filter = {};
+
+      if (
+        [
+          "pending",
+          "approved",
+          "rejected"
+        ].includes(status)
+      ) {
+        filter.status = status;
+      }
+
+      const deposits =
+        await DepositRequest.find(
+          filter
+        )
+          .populate(
+            "userId",
+            "name email phone balance"
+          )
+          .populate(
+            "reviewedBy",
+            "name email"
+          )
+          .sort({
+            createdAt: -1
+          });
+
+      return res.json({
+        success: true,
+        deposits
+      });
+
+    } catch (error) {
+      console.error(
+        "ADMIN_DEPOSITS_ERROR:",
+        error
+      );
+
+      return res.status(500).json({
+        success: false,
+        message:
+          "Pa rive chaje demann depo yo."
+      });
+    }
+  }
+);
+
+
+/* =========================
+   ADMIN APPROVE DEPOSIT
+========================= */
+
+app.patch(
+  "/admin/deposits/:id/approve",
+  requireAuth,
+  requireAdmin,
+  async (req, res) => {
+    const session =
+      await mongoose.startSession();
+
+    try {
+      let payload = null;
+
+      await session.withTransaction(
+        async () => {
+          const deposit =
+            await DepositRequest.findOne({
+              _id: req.params.id,
+              status: "pending"
+            }).session(session);
+
+          if (!deposit) {
+            const error =
+              new Error(
+                "Demann depo sa pa pending oswa li pa egziste."
+              );
+
+            error.statusCode = 409;
+
+            throw error;
+          }
+
+          const user =
+            await User.findById(
+              deposit.userId
+            ).session(session);
+
+          if (!user) {
+            const error =
+              new Error(
+                "Kliyan an pa jwenn."
+              );
+
+            error.statusCode = 404;
+
+            throw error;
+          }
+
+          if (
+            user.status !== "Active"
+          ) {
+            const error =
+              new Error(
+                "Kont kliyan an pa aktif."
+              );
+
+            error.statusCode = 403;
+
+            throw error;
+          }
+
+          user.balance =
+            Number(
+              user.balance || 0
+            ) +
+            Number(
+              deposit.amount
+            );
+
+          await user.save({
+            session
+          });
+
+          deposit.status =
+            "approved";
+
+          deposit.reviewedBy =
+            req.user.userId;
+
+          deposit.reviewedAt =
+            new Date();
+
+          await deposit.save({
+            session
+          });
+
+          await Transaction.create(
+            [
+              {
+                userId:
+                  user._id,
+
+                type:
+                  "deposit",
+
+                amount:
+                  deposit.amount,
+
+                status:
+                  "completed",
+
+                description:
+                  `${deposit.method} deposit approved - ref ${deposit.reference}`,
+
+                createdBy:
+                  req.user.userId
+              }
+            ],
+            {
+              session
+            }
+          );
+
+          const reserve =
+            await getOrCreateReserve(
+              session
+            );
+
+          reserve.cashReserve =
+            Number(
+              reserve.cashReserve || 0
+            ) +
+            Number(
+              deposit.amount
+            );
+
+          reserve.customerLiability =
+            Number(
+              reserve.customerLiability || 0
+            ) +
+            Number(
+              deposit.amount
+            );
+
+          await reserve.save({
+            session
+          });
+
+          payload = {
+            success: true,
+
+            message:
+              "Depo a approve. Balans kliyan an monte otomatikman.",
+
+            deposit,
+
+            user:
+              publicUser(user),
+
+            reserve:
+              reserveView(reserve)
+          };
+        }
+      );
+
+      return res.json(
+        payload
+      );
+
+    } catch (error) {
+      console.error(
+        "APPROVE_DEPOSIT_ERROR:",
+        error
+      );
+
+      return res
+        .status(
+          error.statusCode || 500
+        )
+        .json({
+          success: false,
+
+          message:
+            error.message ||
+            "Pa rive approve depo a."
+        });
+
+    } finally {
+      session.endSession();
+    }
+  }
+);
+
+
+/* =========================
+   ADMIN REJECT DEPOSIT
+========================= */
+
+app.patch(
+  "/admin/deposits/:id/reject",
+  requireAuth,
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const reason = String(
+        req.body.reason || ""
+      ).trim();
+
+      const deposit =
+        await DepositRequest.findOneAndUpdate(
+          {
+            _id: req.params.id,
+            status: "pending"
+          },
+          {
+            $set: {
+              status: "rejected",
+
+              reviewedBy:
+                req.user.userId,
+
+              reviewedAt:
+                new Date(),
+
+              rejectionReason:
+                reason
+            }
+          },
+          {
+            new: true
+          }
+        );
+
+      if (!deposit) {
+        return res.status(409).json({
+          success: false,
+          message:
+            "Demann depo sa pa pending oswa li pa egziste."
+        });
+      }
+
+      return res.json({
+        success: true,
+        message:
+          "Depo a rejte.",
+        deposit
+      });
+
+    } catch (error) {
+      console.error(
+        "REJECT_DEPOSIT_ERROR:",
+        error
+      );
+
+      return res.status(500).json({
+        success: false,
+        message:
+          "Pa rive rejte depo a."
+      });
+    }
+  }
+);
+
+
+/* =========================
+   ADMIN RESERVE
+========================= */
+
+app.get(
+  "/admin/reserve",
+  requireAuth,
+  requireAdmin,
+  async (_req, res) => {
+    try {
+      const reserve =
+        await getOrCreateReserve();
+
+      return res.json({
+        success: true,
+        reserve:
+          reserveView(reserve)
+      });
+
+    } catch (error) {
+      console.error(
+        "ADMIN_RESERVE_ERROR:",
+        error
+      );
+
+      return res.status(500).json({
+        success: false,
+        message:
+          "Pa rive chaje reserve la."
+      });
+    }
+  }
+);
+
+
+/* =========================
+   ADMIN RESERVE ADJUST
+========================= */
+
+app.patch(
+  "/admin/reserve/adjust",
+  requireAuth,
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const amount =
+        Number(
+          req.body.amount
+        );
+
+      if (
+        !Number.isFinite(amount) ||
+        amount === 0
+      ) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Montan reserve la pa valab."
+        });
+      }
+
+      const reserve =
+        await getOrCreateReserve();
+
+      const nextCash =
+        Number(
+          reserve.cashReserve || 0
+        ) + amount;
+
+      if (nextCash < 0) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Cash reserve la pa ka negatif."
+        });
+      }
+
+      reserve.cashReserve =
+        nextCash;
+
+      await reserve.save();
+
+      return res.json({
+        success: true,
+        message:
+          "Reserve la modifye.",
+        reserve:
+          reserveView(reserve)
+      });
+
+    } catch (error) {
+      console.error(
+        "ADMIN_RESERVE_ADJUST_ERROR:",
+        error
+      );
+
+      return res.status(500).json({
+        success: false,
+        message:
+          "Pa rive modifye reserve la."
+      });
+    }
+  }
+);
+
+
+/* =========================
+   ADMIN USER BALANCE
+========================= */
+
+app.patch(
+  "/admin/users/:id/balance",
+  requireAuth,
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const amount =
+        Number(
+          req.body.amount
+        );
+
+      const description =
+        String(
+          req.body.description ||
+          "Admin balance adjustment"
+        ).trim();
+
+      if (
+        !Number.isFinite(amount) ||
+        amount === 0
+      ) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Montan an pa valab."
+        });
+      }
+
+      const user =
+        await User.findOneAndUpdate(
+          {
+            _id:
+              req.params.id,
+
+            balance: {
+              $gte:
+                amount < 0
+                  ? Math.abs(amount)
+                  : 0
+            }
+          },
+          {
+            $inc: {
+              balance: amount
+            }
+          },
+          {
+            new: true
+          }
+        );
+
+      if (!user) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Kliyan an pa jwenn oswa balans lan pa ka vin negatif."
+        });
+      }
+
+      await Transaction.create({
+        userId:
+          user._id,
+
+        type:
+          amount > 0
+            ? "admin_credit"
+            : "admin_debit",
+
+        amount:
+          Math.abs(amount),
+
+        status:
+          "completed",
+
+        description,
+
+        createdBy:
+          req.user.userId
+      });
+
+      const reserve =
+        await getOrCreateReserve();
+
+      reserve.customerLiability =
+        Math.max(
+          0,
+          Number(
+            reserve.customerLiability || 0
+          ) + amount
+        );
+
+      await reserve.save();
+
+      return res.json({
+        success: true,
+
+        message:
+          "Balans kliyan an modifye.",
+
+        user:
+          publicUser(user),
+
+        reserve:
+          reserveView(reserve)
+      });
+
+    } catch (error) {
+      console.error(
+        "ADMIN_BALANCE_ERROR:",
+        error
+      );
+
+      return res.status(500).json({
+        success: false,
+        message:
+          "Pa rive modifye balans kliyan an."
+      });
+    }
+  }
+);
+
+
+/* =========================
+   ADMIN USER STATUS
+========================= */
+
+app.patch(
+  "/admin/users/:id/status",
+  requireAuth,
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const status =
+        String(
+          req.body.status || ""
+        );
+
+      if (
+        ![
+          "Active",
+          "Blocked"
+        ].includes(status)
+      ) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Status la pa valab."
+        });
+      }
+
+      const user =
+        await User.findByIdAndUpdate(
+          req.params.id,
+          {
+            status
+          },
+          {
+            new: true
+          }
+        );
+
+      if (!user) {
+        return res.status(404).json({
+          success: false,
+          message:
+            "Kliyan an pa jwenn."
+        });
+      }
+
+      return res.json({
+        success: true,
+        message:
+          "Status kliyan an modifye.",
+        user:
+          publicUser(user)
+      });
+
+    } catch (error) {
+      console.error(
+        "ADMIN_STATUS_ERROR:",
+        error
+      );
+
+      return res.status(500).json({
+        success: false,
+        message:
+          "Pa rive modifye status kliyan an."
+      });
+    }
+  }
+);
+
+
+/* =========================
+   404 HANDLER
+========================= */
+
+app.use((req, res) => {
+  return res.status(404).json({
+    success: false,
+    message:
+      `Route ${req.method} ${req.path} pa egziste.`
+  });
+});
+
+
+/* =========================
+   ERROR HANDLER
+========================= */
+
+app.use(
+  (error, _req, res, _next) => {
+    console.error(
+      "UNHANDLED_ERROR:",
+      error
+    );
+
+    return res.status(500).json({
+      success: false,
+      message:
+        error.message ||
+        "Yon erè entèn rive sou sèvè a."
+    });
+  }
+);
+
 
 /* =========================
    START SERVER
 ========================= */
 
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`DLM Wallet server running on port ${PORT}`);
-});
+app.listen(
+  PORT,
+  "0.0.0.0",
+  () => {
+    console.log(
+      `DLM Wallet server running on port ${PORT}`
+    );
+  }
+);
