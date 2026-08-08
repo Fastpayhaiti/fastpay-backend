@@ -222,6 +222,22 @@ depositRequestSchema.index(
   { unique: true }
 );
 
+const withdrawalRequestSchema = new mongoose.Schema(
+  {
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+    amount: { type: Number, required: true, min: 0.01 },
+    currency: { type: String, enum: ["USD"], default: "USD" },
+    method: { type: String, enum: ["MonCash", "NatCash", "Bank"], required: true },
+    account: { type: String, required: true, trim: true },
+    note: { type: String, default: "", trim: true },
+    status: { type: String, enum: ["pending", "approved", "rejected"], default: "pending" },
+    reviewedBy: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
+    reviewedAt: { type: Date, default: null },
+    rejectionReason: { type: String, default: "" }
+  },
+  { timestamps: true }
+);
+
 const reserveSchema = new mongoose.Schema(
   {
     key: {
@@ -259,6 +275,10 @@ const Transaction = mongoose.model(
 const DepositRequest = mongoose.model(
   "DepositRequest",
   depositRequestSchema
+);
+const WithdrawalRequest = mongoose.model(
+  "WithdrawalRequest",
+  withdrawalRequestSchema
 );
 const Reserve = mongoose.model(
   "Reserve",
@@ -1019,7 +1039,7 @@ app.get(
 );
 
 /* =========================
-   WITHDRAW / TRANSFER
+   WITHDRAWALS
 ========================= */
 
 app.post(
@@ -1027,96 +1047,66 @@ app.post(
   requireAuth,
   async (req, res) => {
     try {
-      const amount =
-        Number(
-          req.body.amount
-        );
+      const amount = Number(req.body.amount);
+      const method = String(req.body.method || "").trim();
+      const account = String(req.body.account || "").trim();
+      const note = String(req.body.note || "").trim();
 
-      if (
-        !Number.isFinite(amount) ||
-        amount <= 0
-      ) {
-        return res
-          .status(400)
-          .json({
-            success: false,
-            message:
-              "Montan an pa valab."
-          });
+      if (!Number.isFinite(amount) || amount <= 0) {
+        return res.status(400).json({ success: false, message: "Montan retrè a pa valab." });
+      }
+      if (!["MonCash", "NatCash", "Bank"].includes(method)) {
+        return res.status(400).json({ success: false, message: "Metòd retrè a pa valab." });
+      }
+      if (!account) {
+        return res.status(400).json({ success: false, message: "Nimewo oswa kont pou resevwa lajan an obligatwa." });
       }
 
-      const user =
-        await User.findOneAndUpdate(
-          {
-            _id:
-              req.user.userId,
-            balance: {
-              $gte: amount
-            },
-            status:
-              "Active"
-          },
-          {
-            $inc: {
-              balance:
-                -amount
-            }
-          },
-          {
-            new: true
-          }
-        );
-
-      if (!user) {
-        return res
-          .status(400)
-          .json({
-            success: false,
-            message:
-              "Balans pa sifi oswa kont lan pa aktif."
-          });
-      }
-
-      await Transaction.create({
-        userId:
-          user._id,
-        type:
-          "withdraw",
-        amount,
-        status:
-          "completed",
-        description:
-          String(
-            req.body.description ||
-            "Customer withdrawal"
-          )
-      });
-
-      await Reserve.findOneAndUpdate(
-        { key: "main" },
-        {
-          $inc: {
-            customerLiability:
-              -amount
-          }
-        }
+      const user = await User.findOneAndUpdate(
+        { _id: req.user.userId, balance: { $gte: amount }, status: "Active" },
+        { $inc: { balance: -amount } },
+        { new: true }
       );
 
-      return res.json({
-        success: true,
-message: "Retrè a fèt avèk siksè.",
-balance: Number(user.balance)
-});
+      if (!user) {
+        return res.status(400).json({ success: false, message: "Balans pa sifi oswa kont lan pa aktif." });
+      }
 
-} catch (error) {
-  console.error("WITHDRAW_ERROR:", error);
+      try {
+        const withdrawal = await WithdrawalRequest.create({
+          userId: user._id, amount, currency: "USD", method, account, note, status: "pending"
+        });
+        return res.status(201).json({
+          success: true,
+          message: "Demann retrè a voye. Li ap tann verifikasyon admin.",
+          withdrawal,
+          balance: Number(user.balance)
+        });
+      } catch (error) {
+        await User.findByIdAndUpdate(user._id, { $inc: { balance: amount } });
+        throw error;
+      }
+    } catch (error) {
+      console.error("WITHDRAW_REQUEST_ERROR:", error);
+      return res.status(500).json({ success: false, message: "Pa rive kreye demann retrè a." });
+    }
+  }
+);
 
-  return res.status(500).json({
-    success: false,
-    message: "Sèvè a pa rive fè retrè a."
-  });
-}
-});
+app.get(
+  "/withdrawals/mine",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const withdrawals = await WithdrawalRequest.find({ userId: req.user.userId }).sort({ createdAt: -1 });
+      return res.json({ success: true, withdrawals });
+    } catch (error) {
+      console.error("MY_WITHDRAWALS_ERROR:", error);
+      return res.status(500).json({ success: false, message: "Pa rive chaje demann retrè yo." });
+    }
+  }
+);
+
 /* =========================
    TRANSFER
 ========================= */
@@ -1957,6 +1947,125 @@ app.patch(
   }
 );
 
+
+/* =========================
+   ADMIN WITHDRAWALS
+========================= */
+
+app.get(
+  "/admin/withdrawals",
+  requireAuth,
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const status = String(req.query.status || "").trim();
+      const filter = {};
+      if (["pending", "approved", "rejected"].includes(status)) filter.status = status;
+      const withdrawals = await WithdrawalRequest.find(filter)
+        .populate("userId", "name email phone balance")
+        .populate("reviewedBy", "name email")
+        .sort({ createdAt: -1 });
+      return res.json({ success: true, withdrawals });
+    } catch (error) {
+      console.error("ADMIN_WITHDRAWALS_ERROR:", error);
+      return res.status(500).json({ success: false, message: "Pa rive chaje demann retrè yo." });
+    }
+  }
+);
+
+app.patch(
+  "/admin/withdrawals/:id/approve",
+  requireAuth,
+  requireAdmin,
+  async (req, res) => {
+    const session = await mongoose.startSession();
+    try {
+      let payload;
+      await session.withTransaction(async () => {
+        const withdrawal = await WithdrawalRequest.findOne({ _id: req.params.id, status: "pending" }).session(session);
+        if (!withdrawal) { const e = new Error("Demann retrè sa pa pending oswa li pa egziste."); e.statusCode = 409; throw e; }
+        const reserve = await getOrCreateReserve(session);
+        const amount = Number(withdrawal.amount);
+        if (Number(reserve.cashReserve || 0) < amount || Number(reserve.customerLiability || 0) < amount) {
+          const e = new Error("Reserve sistèm nan pa sifi pou approve retrè sa."); e.statusCode = 400; throw e;
+        }
+        withdrawal.status = "approved";
+        withdrawal.reviewedBy = req.user.userId;
+        withdrawal.reviewedAt = new Date();
+        await withdrawal.save({ session });
+        await Transaction.create([{
+          userId: withdrawal.userId, type: "withdraw", amount, status: "completed",
+          description: `${withdrawal.method} withdrawal approved`, createdBy: req.user.userId
+        }], { session });
+        reserve.cashReserve = Number(reserve.cashReserve || 0) - amount;
+        reserve.customerLiability = Number(reserve.customerLiability || 0) - amount;
+        await reserve.save({ session });
+        payload = { success: true, message: "Retrè a approve avèk siksè.", withdrawal, reserve: reserveView(reserve) };
+      });
+      return res.json(payload);
+    } catch (error) {
+      console.error("APPROVE_WITHDRAWAL_ERROR:", error);
+      return res.status(error.statusCode || 500).json({ success: false, message: error.message || "Pa rive approve retrè a." });
+    } finally {
+      session.endSession();
+    }
+  }
+);
+
+app.patch(
+  "/admin/withdrawals/:id/reject",
+  requireAuth,
+  requireAdmin,
+  async (req, res) => {
+    const session = await mongoose.startSession();
+    try {
+      let payload;
+      await session.withTransaction(async () => {
+        const withdrawal = await WithdrawalRequest.findOne({ _id: req.params.id, status: "pending" }).session(session);
+        if (!withdrawal) { const e = new Error("Demann retrè sa pa pending oswa li pa egziste."); e.statusCode = 409; throw e; }
+        const user = await User.findByIdAndUpdate(
+          withdrawal.userId, { $inc: { balance: Number(withdrawal.amount) } }, { new: true, session }
+        );
+        if (!user) { const e = new Error("Kliyan an pa jwenn."); e.statusCode = 404; throw e; }
+        withdrawal.status = "rejected";
+        withdrawal.reviewedBy = req.user.userId;
+        withdrawal.reviewedAt = new Date();
+        withdrawal.rejectionReason = String(req.body.reason || "").trim();
+        await withdrawal.save({ session });
+        payload = { success: true, message: "Retrè a rejte epi balans kliyan an retounen.", withdrawal, user: publicUser(user) };
+      });
+      return res.json(payload);
+    } catch (error) {
+      console.error("REJECT_WITHDRAWAL_ERROR:", error);
+      return res.status(error.statusCode || 500).json({ success: false, message: error.message || "Pa rive rejte retrè a." });
+    } finally {
+      session.endSession();
+    }
+  }
+);
+
+/* =========================
+   ADMIN ALL TRANSACTIONS
+========================= */
+
+app.get(
+  "/admin/transactions",
+  requireAuth,
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const transactions = await Transaction.find({})
+        .populate("userId", "name email phone")
+        .populate("createdBy", "name email")
+        .sort({ createdAt: -1 })
+        .limit(1000);
+      return res.json({ success: true, transactions });
+    } catch (error) {
+      console.error("ADMIN_TRANSACTIONS_ERROR:", error);
+      return res.status(500).json({ success: false, message: "Pa rive chaje tout tranzaksyon yo." });
+    }
+  }
+);
 
 /* =========================
    404 HANDLER
