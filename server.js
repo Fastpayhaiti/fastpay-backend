@@ -1104,5 +1104,24 @@ app.post(
 
       return res.json({
         success: true,
-        message:
-         
+message: "Retrè a fèt avèk siksè.",
+balance: Number(user.balance)
+});
+
+} catch (error) {
+  console.error("WITHDRAW_ERROR:", error);
+
+  return res.status(500).json({
+    success: false,
+    message: "Sèvè a pa rive fè retrè a."
+  });
+}
+});
+
+/* =========================
+   START SERVER
+========================= */
+
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`DLM Wallet server running on port ${PORT}`);
+});
