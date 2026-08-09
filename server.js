@@ -36,7 +36,7 @@ app.use(
   })
 );
 
-app.use(express.json({ limit: "100kb" }));
+app.use(express.json({ limit: "6mb" }));
 
 if (!process.env.MONGO_URI) {
   throw new Error(
@@ -321,6 +321,35 @@ const serviceOrderSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
+
+const kycProfileSchema = new mongoose.Schema(
+  {
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, unique: true },
+    documentType: { type: String, enum: ["national_id","passport","drivers_license"], required: true },
+    documentNumber: { type: String, required: true, trim: true },
+    documentFront: { type: String, required: true },
+    documentBack: { type: String, default: "" },
+    selfieImage: { type: String, required: true },
+    status: { type: String, enum: ["pending","verified","rejected"], default: "pending" },
+    rejectionReason: { type: String, default: "" },
+    reviewedBy: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
+    reviewedAt: { type: Date, default: null }
+  },
+  { timestamps: true }
+);
+
+const virtualCardRequestSchema = new mongoose.Schema(
+  {
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+    fee: { type: Number, default: 10, min: 10 },
+    currency: { type: String, default: "USD" },
+    status: { type: String, enum: ["pending","approved","rejected"], default: "pending" },
+    reviewedBy: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
+    reviewedAt: { type: Date, default: null }
+  },
+  { timestamps: true }
+);
+
 /* =========================
    MODELS
 ========================= */
@@ -343,6 +372,10 @@ const ServiceOrder = mongoose.model(
   "ServiceOrder",
   serviceOrderSchema
 );
+
+const KycProfile = mongoose.model("KycProfile", kycProfileSchema);
+const VirtualCardRequest = mongoose.model("VirtualCardRequest", virtualCardRequestSchema);
+
 
 /* =========================
    HELPERS
@@ -2928,6 +2961,289 @@ app.patch(
     }
   }
 );
+
+
+/* =========================
+   KYC / CARD APPLICATION
+========================= */
+
+function validKycImage(value) {
+  const text = String(value || "");
+  return /^data:image\/(jpeg|jpg|png|webp);base64,/i.test(text) && text.length <= 2200000;
+}
+
+app.get("/kyc/status", requireAuth, async (req, res) => {
+  try {
+    const kyc = await KycProfile.findOne({ userId: req.user.userId })
+      .select("-documentFront -documentBack -selfieImage");
+
+    return res.json({
+      success: true,
+      kyc: kyc || { status: "not_submitted" }
+    });
+  } catch {
+    return res.status(500).json({ success: false, message: "Pa rive chaje KYC la." });
+  }
+});
+
+app.post("/kyc/submit", requireAuth, async (req, res) => {
+  try {
+    const documentType = String(req.body.documentType || "").trim();
+    const documentNumber = String(req.body.documentNumber || "").trim();
+    const documentFront = String(req.body.documentFront || "");
+    const documentBack = String(req.body.documentBack || "");
+    const selfieImage = String(req.body.selfieImage || "");
+
+    if (!["national_id","passport","drivers_license"].includes(documentType)) {
+      return res.status(400).json({ success: false, message: "Kalite pyès la pa valab." });
+    }
+
+    if (
+      documentNumber.length < 4 ||
+      !validKycImage(documentFront) ||
+      !validKycImage(selfieImage) ||
+      (documentBack && !validKycImage(documentBack))
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Verifye nimewo pyès la ak foto yo."
+      });
+    }
+
+    const existing = await KycProfile.findOne({ userId: req.user.userId });
+
+    if (existing && existing.status === "verified") {
+      return res.status(409).json({ success: false, message: "KYC deja verifye." });
+    }
+
+    const kyc = await KycProfile.findOneAndUpdate(
+      { userId: req.user.userId },
+      {
+        $set: {
+          documentType,
+          documentNumber,
+          documentFront,
+          documentBack,
+          selfieImage,
+          status: "pending",
+          rejectionReason: "",
+          reviewedBy: null,
+          reviewedAt: null
+        }
+      },
+      { new: true, upsert: true, setDefaultsOnInsert: true }
+    );
+
+    return res.status(201).json({
+      success: true,
+      message: "KYC la voye. Li ap tann verifikasyon.",
+      kyc: { id: kyc._id, status: kyc.status }
+    });
+  } catch (error) {
+    console.error("KYC_SUBMIT_ERROR:", error);
+    return res.status(500).json({ success: false, message: "Pa rive voye KYC la." });
+  }
+});
+
+app.get("/admin/kyc", requireAuth, requireAdmin, async (_req, res) => {
+  try {
+    const items = await KycProfile.find({})
+      .populate("userId", "name email phone")
+      .sort({ createdAt: -1 });
+
+    return res.json({ success: true, items });
+  } catch {
+    return res.status(500).json({ success: false, message: "Pa rive chaje KYC yo." });
+  }
+});
+
+app.patch("/admin/kyc/:id", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const action = String(req.body.action || "").trim();
+    const rejectionReason = String(req.body.rejectionReason || "").trim();
+
+    if (!["verify","reject"].includes(action)) {
+      return res.status(400).json({ success: false, message: "Aksyon an pa valab." });
+    }
+
+    const kyc = await KycProfile.findById(req.params.id);
+
+    if (!kyc) {
+      return res.status(404).json({ success: false, message: "KYC la pa jwenn." });
+    }
+
+    if (action === "reject" && !rejectionReason) {
+      return res.status(400).json({ success: false, message: "Mete rezon rejè a." });
+    }
+
+    kyc.status = action === "verify" ? "verified" : "rejected";
+    kyc.rejectionReason = action === "reject" ? rejectionReason : "";
+    kyc.reviewedBy = req.user.userId;
+    kyc.reviewedAt = new Date();
+
+    await kyc.save();
+
+    return res.json({
+      success: true,
+      message: action === "verify" ? "KYC verifye." : "KYC rejte."
+    });
+  } catch {
+    return res.status(500).json({ success: false, message: "Pa rive modifye KYC la." });
+  }
+});
+
+app.get("/card/status", requireAuth, async (req, res) => {
+  try {
+    const [user, kyc, cardRequest] = await Promise.all([
+      User.findById(req.user.userId).select("balance"),
+      KycProfile.findOne({ userId: req.user.userId }).select("status"),
+      VirtualCardRequest.findOne({ userId: req.user.userId }).sort({ createdAt: -1 })
+    ]);
+
+    return res.json({
+      success: true,
+      balance: Number(user?.balance || 0),
+      minimumBalance: 10,
+      kycStatus: kyc?.status || "not_submitted",
+      cardRequest: cardRequest || null
+    });
+  } catch {
+    return res.status(500).json({ success: false, message: "Pa rive chaje status kat la." });
+  }
+});
+
+app.post("/card/request", requireAuth, async (req, res) => {
+  try {
+    const fee = 10;
+
+    const kyc = await KycProfile.findOne({ userId: req.user.userId });
+
+    if (!kyc || kyc.status !== "verified") {
+      return res.status(403).json({
+        success: false,
+        message: "KYC dwe verifye anvan ou mande kat la."
+      });
+    }
+
+    const existing = await VirtualCardRequest.findOne({
+      userId: req.user.userId,
+      status: { $in: ["pending","approved"] }
+    });
+
+    if (existing) {
+      return res.status(409).json({ success: false, message: "Ou deja gen yon demann kat aktif." });
+    }
+
+    const user = await User.findOneAndUpdate(
+      {
+        _id: req.user.userId,
+        balance: { $gte: fee },
+        status: "Active"
+      },
+      { $inc: { balance: -fee } },
+      { new: true }
+    );
+
+    if (!user) {
+      return res.status(400).json({
+        success: false,
+        message: "Ou bezwen omwen $10 USD sou DLM Wallet ou."
+      });
+    }
+
+    try {
+      const request = await VirtualCardRequest.create({
+        userId: user._id,
+        fee,
+        currency: "USD",
+        status: "pending"
+      });
+
+      await Transaction.create({
+        userId: user._id,
+        type: "admin_debit",
+        amount: fee,
+        status: "completed",
+        description: `Virtual card application ${request._id}`
+      });
+
+      await Reserve.findOneAndUpdate(
+        { key: "main" },
+        { $inc: { customerLiability: -fee } }
+      );
+
+      return res.status(201).json({
+        success: true,
+        message: "Demann kat la resevwa. Li ap tann revizyon.",
+        balance: Number(user.balance),
+        request
+      });
+    } catch (error) {
+      await User.findByIdAndUpdate(user._id, { $inc: { balance: fee } });
+      throw error;
+    }
+  } catch (error) {
+    console.error("CARD_REQUEST_ERROR:", error);
+    return res.status(500).json({ success: false, message: "Pa rive kreye demann kat la." });
+  }
+});
+
+app.get("/admin/card-requests", requireAuth, requireAdmin, async (_req, res) => {
+  try {
+    const requests = await VirtualCardRequest.find({})
+      .populate("userId", "name email phone balance")
+      .sort({ createdAt: -1 });
+
+    return res.json({ success: true, requests });
+  } catch {
+    return res.status(500).json({ success: false, message: "Pa rive chaje demann kat yo." });
+  }
+});
+
+app.patch("/admin/card-requests/:id", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const action = String(req.body.action || "").trim();
+
+    if (!["approve","reject"].includes(action)) {
+      return res.status(400).json({ success: false, message: "Aksyon an pa valab." });
+    }
+
+    const request = await VirtualCardRequest.findById(req.params.id);
+
+    if (!request) {
+      return res.status(404).json({ success: false, message: "Demann kat la pa jwenn." });
+    }
+
+    if (request.status !== "pending") {
+      return res.status(409).json({ success: false, message: "Demann sa deja trete." });
+    }
+
+    request.status = action === "approve" ? "approved" : "rejected";
+    request.reviewedBy = req.user.userId;
+    request.reviewedAt = new Date();
+
+    await request.save();
+
+    if (action === "reject") {
+      await User.findByIdAndUpdate(request.userId, { $inc: { balance: request.fee } });
+
+      const reserve = await getOrCreateReserve();
+      reserve.customerLiability =
+        Number(reserve.customerLiability || 0) + Number(request.fee || 0);
+      await reserve.save();
+    }
+
+    return res.json({
+      success: true,
+      message:
+        action === "approve"
+          ? "Demann kat la apwouve. Konekte yon card issuer pou emèt kat reyèl la."
+          : "Demann kat la rejte epi frè a retounen sou wallet la."
+    });
+  } catch {
+    return res.status(500).json({ success: false, message: "Pa rive trete demann kat la." });
+  }
+});
 
 /* =========================
    404 HANDLER
