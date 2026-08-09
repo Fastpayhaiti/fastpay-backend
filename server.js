@@ -160,15 +160,6 @@ const transactionSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: "User",
       default: null
-    },
-    externalId: {
-      type: String,
-      default: null,
-      index: true
-    },
-    metadata: {
-      type: mongoose.Schema.Types.Mixed,
-      default: null
     }
   },
   { timestamps: true }
@@ -233,22 +224,6 @@ depositRequestSchema.index(
   { unique: true }
 );
 
-const withdrawalRequestSchema = new mongoose.Schema(
-  {
-    userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
-    amount: { type: Number, required: true, min: 0.01 },
-    currency: { type: String, enum: ["USD"], default: "USD" },
-    method: { type: String, enum: ["MonCash", "NatCash", "Bank"], required: true },
-    account: { type: String, required: true, trim: true },
-    note: { type: String, default: "", trim: true },
-    status: { type: String, enum: ["pending", "approved", "rejected"], default: "pending" },
-    reviewedBy: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
-    reviewedAt: { type: Date, default: null },
-    rejectionReason: { type: String, default: "" }
-  },
-  { timestamps: true }
-);
-
 const reserveSchema = new mongoose.Schema(
   {
     key: {
@@ -286,10 +261,6 @@ const Transaction = mongoose.model(
 const DepositRequest = mongoose.model(
   "DepositRequest",
   depositRequestSchema
-);
-const WithdrawalRequest = mongoose.model(
-  "WithdrawalRequest",
-  withdrawalRequestSchema
 );
 const Reserve = mongoose.model(
   "Reserve",
@@ -1050,7 +1021,7 @@ app.get(
 );
 
 /* =========================
-   WITHDRAWALS
+   WITHDRAW / TRANSFER
 ========================= */
 
 app.post(
@@ -1058,66 +1029,96 @@ app.post(
   requireAuth,
   async (req, res) => {
     try {
-      const amount = Number(req.body.amount);
-      const method = String(req.body.method || "").trim();
-      const account = String(req.body.account || "").trim();
-      const note = String(req.body.note || "").trim();
+      const amount =
+        Number(
+          req.body.amount
+        );
 
-      if (!Number.isFinite(amount) || amount <= 0) {
-        return res.status(400).json({ success: false, message: "Montan retrè a pa valab." });
-      }
-      if (!["MonCash", "NatCash", "Bank"].includes(method)) {
-        return res.status(400).json({ success: false, message: "Metòd retrè a pa valab." });
-      }
-      if (!account) {
-        return res.status(400).json({ success: false, message: "Nimewo oswa kont pou resevwa lajan an obligatwa." });
+      if (
+        !Number.isFinite(amount) ||
+        amount <= 0
+      ) {
+        return res
+          .status(400)
+          .json({
+            success: false,
+            message:
+              "Montan an pa valab."
+          });
       }
 
-      const user = await User.findOneAndUpdate(
-        { _id: req.user.userId, balance: { $gte: amount }, status: "Active" },
-        { $inc: { balance: -amount } },
-        { new: true }
-      );
+      const user =
+        await User.findOneAndUpdate(
+          {
+            _id:
+              req.user.userId,
+            balance: {
+              $gte: amount
+            },
+            status:
+              "Active"
+          },
+          {
+            $inc: {
+              balance:
+                -amount
+            }
+          },
+          {
+            new: true
+          }
+        );
 
       if (!user) {
-        return res.status(400).json({ success: false, message: "Balans pa sifi oswa kont lan pa aktif." });
+        return res
+          .status(400)
+          .json({
+            success: false,
+            message:
+              "Balans pa sifi oswa kont lan pa aktif."
+          });
       }
 
-      try {
-        const withdrawal = await WithdrawalRequest.create({
-          userId: user._id, amount, currency: "USD", method, account, note, status: "pending"
-        });
-        return res.status(201).json({
-          success: true,
-          message: "Demann retrè a voye. Li ap tann verifikasyon admin.",
-          withdrawal,
-          balance: Number(user.balance)
-        });
-      } catch (error) {
-        await User.findByIdAndUpdate(user._id, { $inc: { balance: amount } });
-        throw error;
-      }
-    } catch (error) {
-      console.error("WITHDRAW_REQUEST_ERROR:", error);
-      return res.status(500).json({ success: false, message: "Pa rive kreye demann retrè a." });
-    }
-  }
-);
+      await Transaction.create({
+        userId:
+          user._id,
+        type:
+          "withdraw",
+        amount,
+        status:
+          "completed",
+        description:
+          String(
+            req.body.description ||
+            "Customer withdrawal"
+          )
+      });
 
-app.get(
-  "/withdrawals/mine",
-  requireAuth,
-  async (req, res) => {
-    try {
-      const withdrawals = await WithdrawalRequest.find({ userId: req.user.userId }).sort({ createdAt: -1 });
-      return res.json({ success: true, withdrawals });
-    } catch (error) {
-      console.error("MY_WITHDRAWALS_ERROR:", error);
-      return res.status(500).json({ success: false, message: "Pa rive chaje demann retrè yo." });
-    }
-  }
-);
+      await Reserve.findOneAndUpdate(
+        { key: "main" },
+        {
+          $inc: {
+            customerLiability:
+              -amount
+          }
+        }
+      );
 
+      return res.json({
+        success: true,
+message: "Retrè a fèt avèk siksè.",
+balance: Number(user.balance)
+});
+
+} catch (error) {
+  console.error("WITHDRAW_ERROR:", error);
+
+  return res.status(500).json({
+    success: false,
+    message: "Sèvè a pa rive fè retrè a."
+  });
+}
+});
 /* =========================
    TRANSFER
 ========================= */
@@ -1959,511 +1960,593 @@ app.patch(
 );
 
 
-/* =========================
-   ADMIN WITHDRAWALS
-========================= */
-
-app.get(
-  "/admin/withdrawals",
-  requireAuth,
-  requireAdmin,
-  async (req, res) => {
-    try {
-      const status = String(req.query.status || "").trim();
-      const filter = {};
-      if (["pending", "approved", "rejected"].includes(status)) filter.status = status;
-      const withdrawals = await WithdrawalRequest.find(filter)
-        .populate("userId", "name email phone balance")
-        .populate("reviewedBy", "name email")
-        .sort({ createdAt: -1 });
-      return res.json({ success: true, withdrawals });
-    } catch (error) {
-      console.error("ADMIN_WITHDRAWALS_ERROR:", error);
-      return res.status(500).json({ success: false, message: "Pa rive chaje demann retrè yo." });
-    }
-  }
-);
-
-app.patch(
-  "/admin/withdrawals/:id/approve",
-  requireAuth,
-  requireAdmin,
-  async (req, res) => {
-    const session = await mongoose.startSession();
-    try {
-      let payload;
-      await session.withTransaction(async () => {
-        const withdrawal = await WithdrawalRequest.findOne({ _id: req.params.id, status: "pending" }).session(session);
-        if (!withdrawal) { const e = new Error("Demann retrè sa pa pending oswa li pa egziste."); e.statusCode = 409; throw e; }
-        const reserve = await getOrCreateReserve(session);
-        const amount = Number(withdrawal.amount);
-        if (Number(reserve.cashReserve || 0) < amount || Number(reserve.customerLiability || 0) < amount) {
-          const e = new Error("Reserve sistèm nan pa sifi pou approve retrè sa."); e.statusCode = 400; throw e;
-        }
-        withdrawal.status = "approved";
-        withdrawal.reviewedBy = req.user.userId;
-        withdrawal.reviewedAt = new Date();
-        await withdrawal.save({ session });
-        await Transaction.create([{
-          userId: withdrawal.userId, type: "withdraw", amount, status: "completed",
-          description: `${withdrawal.method} withdrawal approved`, createdBy: req.user.userId
-        }], { session });
-        reserve.cashReserve = Number(reserve.cashReserve || 0) - amount;
-        reserve.customerLiability = Number(reserve.customerLiability || 0) - amount;
-        await reserve.save({ session });
-        payload = { success: true, message: "Retrè a approve avèk siksè.", withdrawal, reserve: reserveView(reserve) };
-      });
-      return res.json(payload);
-    } catch (error) {
-      console.error("APPROVE_WITHDRAWAL_ERROR:", error);
-      return res.status(error.statusCode || 500).json({ success: false, message: error.message || "Pa rive approve retrè a." });
-    } finally {
-      session.endSession();
-    }
-  }
-);
-
-app.patch(
-  "/admin/withdrawals/:id/reject",
-  requireAuth,
-  requireAdmin,
-  async (req, res) => {
-    const session = await mongoose.startSession();
-    try {
-      let payload;
-      await session.withTransaction(async () => {
-        const withdrawal = await WithdrawalRequest.findOne({ _id: req.params.id, status: "pending" }).session(session);
-        if (!withdrawal) { const e = new Error("Demann retrè sa pa pending oswa li pa egziste."); e.statusCode = 409; throw e; }
-        const user = await User.findByIdAndUpdate(
-          withdrawal.userId, { $inc: { balance: Number(withdrawal.amount) } }, { new: true, session }
-        );
-        if (!user) { const e = new Error("Kliyan an pa jwenn."); e.statusCode = 404; throw e; }
-        withdrawal.status = "rejected";
-        withdrawal.reviewedBy = req.user.userId;
-        withdrawal.reviewedAt = new Date();
-        withdrawal.rejectionReason = String(req.body.reason || "").trim();
-        await withdrawal.save({ session });
-        payload = { success: true, message: "Retrè a rejte epi balans kliyan an retounen.", withdrawal, user: publicUser(user) };
-      });
-      return res.json(payload);
-    } catch (error) {
-      console.error("REJECT_WITHDRAWAL_ERROR:", error);
-      return res.status(error.statusCode || 500).json({ success: false, message: error.message || "Pa rive rejte retrè a." });
-    } finally {
-      session.endSession();
-    }
-  }
-);
 
 /* =========================
-   ADMIN ALL TRANSACTIONS
+   RELOADLY
 ========================= */
 
-app.get(
-  "/admin/transactions",
-  requireAuth,
-  requireAdmin,
-  async (req, res) => {
-    try {
-      const transactions = await Transaction.find({})
-        .populate("userId", "name email phone")
-        .populate("createdBy", "name email")
-        .sort({ createdAt: -1 })
-        .limit(1000);
-      return res.json({ success: true, transactions });
-    } catch (error) {
-      console.error("ADMIN_TRANSACTIONS_ERROR:", error);
-      return res.status(500).json({ success: false, message: "Pa rive chaje tout tranzaksyon yo." });
-    }
-  }
-);
+const RELOADLY_MODE = String(
+  process.env.RELOADLY_MODE || "sandbox"
+).trim().toLowerCase();
 
+const RELOADLY_CLIENT_ID = String(
+  process.env.RELOADLY_CLIENT_ID || ""
+).trim();
 
-/* =========================
-   RELOADLY INTEGRATION
-   Airtime topups + Gift Card catalog
-========================= */
+const RELOADLY_CLIENT_SECRET = String(
+  process.env.RELOADLY_CLIENT_SECRET || ""
+).trim();
 
-const RELOADLY_MODE = String(process.env.RELOADLY_MODE || "sandbox").trim().toLowerCase();
-const RELOADLY_CLIENT_ID = String(process.env.RELOADLY_CLIENT_ID || "").trim();
-const RELOADLY_CLIENT_SECRET = String(process.env.RELOADLY_CLIENT_SECRET || "").trim();
-const RELOADLY_AIRTIME_URL = RELOADLY_MODE === "live"
-  ? "https://topups.reloadly.com"
-  : "https://topups-sandbox.reloadly.com";
-const RELOADLY_GIFTCARD_URL = RELOADLY_MODE === "live"
-  ? "https://giftcards.reloadly.com"
-  : "https://giftcards-sandbox.reloadly.com";
+function reloadlyBases() {
+  const live = RELOADLY_MODE === "live" || RELOADLY_MODE === "production";
 
-const reloadlyTokenCache = new Map();
+  return {
+    airtime: live
+      ? "https://topups.reloadly.com"
+      : "https://topups-sandbox.reloadly.com",
+
+    giftcards: live
+      ? "https://giftcards.reloadly.com"
+      : "https://giftcards-sandbox.reloadly.com"
+  };
+}
 
 function reloadlyConfigured() {
-  return Boolean(RELOADLY_CLIENT_ID && RELOADLY_CLIENT_SECRET);
+  return Boolean(
+    RELOADLY_CLIENT_ID &&
+    RELOADLY_CLIENT_SECRET
+  );
 }
 
-async function reloadlyToken(audience) {
-  if (!reloadlyConfigured()) {
-    const e = new Error("Reloadly poko configure sou Render. Mete RELOADLY_CLIENT_ID ak RELOADLY_CLIENT_SECRET.");
-    e.statusCode = 503;
-    throw e;
+async function reloadlyJson(url, options = {}) {
+  const response = await fetch(url, options);
+  const text = await response.text();
+
+  let data = {};
+
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch {
+    data = {
+      message: text || "Reloadly te retounen yon repons ki pa JSON."
+    };
   }
 
-  const cached = reloadlyTokenCache.get(audience);
-  if (cached && cached.expiresAt > Date.now() + 60000) return cached.token;
-
-  const response = await fetch("https://auth.reloadly.com/oauth/token", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      client_id: RELOADLY_CLIENT_ID,
-      client_secret: RELOADLY_CLIENT_SECRET,
-      grant_type: "client_credentials",
-      audience
-    })
-  });
-
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok || !data.access_token) {
-    const e = new Error(data.message || data.error_description || "Reloadly authentication echwe.");
-    e.statusCode = 502;
-    throw e;
-  }
-
-  reloadlyTokenCache.set(audience, {
-    token: data.access_token,
-    expiresAt: Date.now() + Math.max(60, Number(data.expires_in || 3600)) * 1000
-  });
-  return data.access_token;
-}
-
-async function reloadlyRequest(baseUrl, path, options = {}) {
-  const token = await reloadlyToken(baseUrl);
-  const response = await fetch(`${baseUrl}${path}`, {
-    method: options.method || "GET",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      Accept: "application/json",
-      "Content-Type": "application/json",
-      ...(options.headers || {})
-    },
-    body: options.body ? JSON.stringify(options.body) : undefined
-  });
-
-  const data = await response.json().catch(() => ({}));
   if (!response.ok) {
-    const e = new Error(data.message || data.errorCode || `Reloadly request echwe (${response.status}).`);
-    e.statusCode = response.status >= 400 && response.status < 500 ? 400 : 502;
-    e.reloadly = data;
-    throw e;
+    const error = new Error(
+      data.message ||
+      data.error_description ||
+      data.errorCode ||
+      `Reloadly request failed (${response.status}).`
+    );
+
+    error.statusCode = response.status;
+    error.reloadly = data;
+    throw error;
   }
+
   return data;
 }
 
+const reloadlyTokenCache = {
+  airtime: null,
+  giftcards: null
+};
 
-function roundMoney(value) {
-  return Math.round((Number(value) + Number.EPSILON) * 100) / 100;
-}
-
-function giftCardSenderUnitPrice(product, unitPrice) {
-  const recipientPrice = Number(unitPrice);
-  if (!Number.isFinite(recipientPrice) || recipientPrice <= 0) return null;
-
-  if (String(product.denominationType || "").toUpperCase() === "FIXED") {
-    const allowed = Array.isArray(product.fixedRecipientDenominations)
-      ? product.fixedRecipientDenominations.map(Number)
-      : [];
-    if (!allowed.some(v => Math.abs(v - recipientPrice) < 0.001)) return null;
-
-    const maps = Array.isArray(product.fixedRecipientToSenderDenominationsMap)
-      ? product.fixedRecipientToSenderDenominationsMap
-      : [];
-    for (const entry of maps) {
-      if (!entry || typeof entry !== "object") continue;
-      for (const [k, v] of Object.entries(entry)) {
-        if (Math.abs(Number(k) - recipientPrice) < 0.001) return Number(v);
-      }
-    }
-  } else {
-    const min = Number(product.minRecipientDenomination || 0);
-    const max = Number(product.maxRecipientDenomination || product.maxrecipientDenomination || 0);
-    if (min && recipientPrice < min) return null;
-    if (max && recipientPrice > max) return null;
-  }
-
-  const rate = Number(product.recipientCurrencyToSenderCurrencyExchangeRate || 1);
-  return recipientPrice * rate;
-}
-
-app.get("/reloadly/status", requireAuth, async (_req, res) => {
-  return res.json({
-    success: true,
-    configured: reloadlyConfigured(),
-    mode: RELOADLY_MODE === "live" ? "live" : "sandbox",
-    airtime: true,
-    giftCardsCatalog: true
-  });
-});
-
-app.get("/reloadly/operators/countries/:countryCode", requireAuth, async (req, res) => {
-  try {
-    const countryCode = String(req.params.countryCode || "").trim().toUpperCase();
-    if (!/^[A-Z]{2}$/.test(countryCode)) return res.status(400).json({ success:false, message:"Country code la pa valab." });
-    const data = await reloadlyRequest(RELOADLY_AIRTIME_URL, `/operators/countries/${encodeURIComponent(countryCode)}?includeBundles=true&includeData=true&includePin=true&suggestedAmounts=true&suggestedAmountsMap=true`);
-    return res.json({ success:true, operators:data });
-  } catch (error) {
-    console.error("RELOADLY_OPERATORS_ERROR:", error.reloadly || error);
-    return res.status(error.statusCode || 500).json({ success:false, message:error.message });
-  }
-});
-
-app.get("/reloadly/operators/auto-detect", requireAuth, async (req, res) => {
-  try {
-    const phone = String(req.query.phone || "").replace(/[^0-9+]/g, "");
-    const countryCode = String(req.query.countryCode || "HT").trim().toUpperCase();
-    if (!phone) return res.status(400).json({ success:false, message:"Nimewo telefòn lan obligatwa." });
-    const data = await reloadlyRequest(RELOADLY_AIRTIME_URL, `/operators/auto-detect/phone/${encodeURIComponent(phone)}/countries/${encodeURIComponent(countryCode)}?suggestedAmounts=true&suggestedAmountsMap=true`);
-    return res.json({ success:true, operator:data });
-  } catch (error) {
-    console.error("RELOADLY_AUTODETECT_ERROR:", error.reloadly || error);
-    return res.status(error.statusCode || 500).json({ success:false, message:error.message });
-  }
-});
-
-app.post("/reloadly/topups", requireAuth, async (req, res) => {
-  let debitedUser = null;
-  try {
-    const amount = Number(req.body.amount);
-    const operatorId = Number(req.body.operatorId);
-    const countryCode = String(req.body.countryCode || "HT").trim().toUpperCase();
-    const number = String(req.body.number || "").replace(/[^0-9]/g, "");
-
-    if (!Number.isFinite(amount) || amount <= 0) return res.status(400).json({ success:false, message:"Montan topup la pa valab." });
-    if (!Number.isInteger(operatorId) || operatorId <= 0) return res.status(400).json({ success:false, message:"Operator ID la pa valab." });
-    if (!/^[A-Z]{2}$/.test(countryCode) || !number) return res.status(400).json({ success:false, message:"Country code oswa nimewo telefòn lan pa valab." });
-
-    debitedUser = await User.findOneAndUpdate(
-      { _id:req.user.userId, balance:{ $gte:amount }, status:"Active" },
-      { $inc:{ balance:-amount } },
-      { new:true }
+async function getReloadlyToken(product) {
+  if (!reloadlyConfigured()) {
+    const error = new Error(
+      "Reloadly poko configure sou server la."
     );
-    if (!debitedUser) return res.status(400).json({ success:false, message:"Balans pa sifi oswa kont lan pa aktif." });
+    error.statusCode = 503;
+    throw error;
+  }
 
-    const customIdentifier = `DLM-TOPUP-${debitedUser._id}-${Date.now()}`;
-    const data = await reloadlyRequest(RELOADLY_AIRTIME_URL, "/topups", {
-      method:"POST",
-      body:{
-        operatorId,
-        amount,
-        useLocalAmount:false,
-        customIdentifier,
-        recipientPhone:{ countryCode, number }
-      }
-    });
+  const bases = reloadlyBases();
+  const audience =
+    product === "giftcards"
+      ? bases.giftcards
+      : bases.airtime;
 
-    await Transaction.create({
-      userId:debitedUser._id,
-      type:"topup",
-      amount,
-      status:"completed",
-      description:`Reloadly topup ${countryCode} ${number} - ${data.transactionId || customIdentifier}`,
-      externalId:String(data.transactionId || customIdentifier),
-      metadata:{
-        provider:"Reloadly",
-        operatorName:data.operatorName || "",
-        recipientPhone:data.recipientPhone || `${countryCode}${number}`
-      }
-    });
+  const cached = reloadlyTokenCache[product];
+  const now = Date.now();
 
-    return res.json({
-      success:true,
-      message:"Topup la voye avèk siksè.",
-      balance:Number(debitedUser.balance),
-      topup:{
-        transactionId:data.transactionId,
-        status:data.status,
-        operatorName:data.operatorName,
-        recipientPhone:data.recipientPhone,
-        deliveredAmount:data.deliveredAmount,
-        deliveredAmountCurrencyCode:data.deliveredAmountCurrencyCode
-      }
-    });
-  } catch (error) {
-    if (debitedUser) {
-      try { await User.findByIdAndUpdate(debitedUser._id, { $inc:{ balance:Number(req.body.amount || 0) } }); } catch {}
+  if (
+    cached &&
+    cached.token &&
+    cached.expiresAt > now + 60000
+  ) {
+    return cached.token;
+  }
+
+  const data = await reloadlyJson(
+    "https://auth.reloadly.com/oauth/token",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json"
+      },
+      body: JSON.stringify({
+        client_id: RELOADLY_CLIENT_ID,
+        client_secret: RELOADLY_CLIENT_SECRET,
+        grant_type: "client_credentials",
+        audience
+      })
     }
-    console.error("RELOADLY_TOPUP_ERROR:", error.reloadly || error);
-    return res.status(error.statusCode || 500).json({ success:false, message:error.message || "Topup la echwe; balans kliyan an retounen." });
+  );
+
+  const token = data.access_token;
+
+  if (!token) {
+    const error = new Error(
+      "Reloadly pa retounen access token."
+    );
+    error.statusCode = 502;
+    throw error;
   }
-});
 
-app.get("/reloadly/giftcards/products", requireAuth, async (req, res) => {
-  try {
-    const countryCode = String(req.query.countryCode || "US").trim().toUpperCase();
-    const size = Math.min(100, Math.max(1, Number(req.query.size || 50)));
-    const page = Math.max(1, Number(req.query.page || 1));
-    const data = await reloadlyRequest(RELOADLY_GIFTCARD_URL, `/products?countryCode=${encodeURIComponent(countryCode)}&size=${size}&page=${page}`);
-    return res.json({ success:true, products:data });
-  } catch (error) {
-    console.error("RELOADLY_GIFTCARDS_ERROR:", error.reloadly || error);
-    return res.status(error.statusCode || 500).json({ success:false, message:error.message });
+  const expiresIn = Number(data.expires_in || 3600);
+
+  reloadlyTokenCache[product] = {
+    token,
+    expiresAt: now + expiresIn * 1000
+  };
+
+  return token;
+}
+
+async function reloadlyRequest(product, path, options = {}) {
+  const bases = reloadlyBases();
+  const base = product === "giftcards" ? bases.giftcards : bases.airtime;
+  const token = await getReloadlyToken(product);
+
+  const accept =
+    product === "giftcards"
+      ? "application/com.reloadly.giftcards-v1+json"
+      : "application/com.reloadly.topups-v1+json";
+
+  return reloadlyJson(
+    `${base}${path}`,
+    {
+      ...options,
+      headers: {
+        Accept: accept,
+        Authorization: `Bearer ${token}`,
+        ...(options.body ? { "Content-Type": "application/json" } : {}),
+        ...(options.headers || {})
+      }
+    }
+  );
+}
+
+function normalizePhone(value) {
+  return String(value || "").replace(/[^0-9]/g, "");
+}
+
+async function deductCustomerBalance(userId, amount) {
+  return User.findOneAndUpdate(
+    {
+      _id: userId,
+      balance: { $gte: amount },
+      status: "Active"
+    },
+    {
+      $inc: { balance: -amount }
+    },
+    {
+      new: true
+    }
+  );
+}
+
+async function refundCustomerBalance(userId, amount) {
+  return User.findByIdAndUpdate(
+    userId,
+    {
+      $inc: { balance: amount }
+    },
+    {
+      new: true
+    }
+  );
+}
+
+async function reduceCustomerLiability(amount) {
+  const reserve = await getOrCreateReserve();
+  reserve.customerLiability = Math.max(
+    0,
+    Number(reserve.customerLiability || 0) - Number(amount || 0)
+  );
+  await reserve.save();
+  return reserve;
+}
+
+app.get(
+  "/reloadly/status",
+  requireAuth,
+  async (_req, res) => {
+    return res.json({
+      success: true,
+      configured: reloadlyConfigured(),
+      mode: RELOADLY_MODE,
+      airtimeBase: reloadlyBases().airtime,
+      giftcardsBase: reloadlyBases().giftcards
+    });
   }
-});
-
-app.get("/reloadly/giftcards/products/:productId", requireAuth, async (req, res) => {
-  try {
-    const productId = Number(req.params.productId);
-    if (!Number.isInteger(productId) || productId <= 0) return res.status(400).json({ success:false, message:"Product ID la pa valab." });
-    const data = await reloadlyRequest(RELOADLY_GIFTCARD_URL, `/products/${productId}`);
-    return res.json({ success:true, product:data });
-  } catch (error) {
-    console.error("RELOADLY_GIFTCARD_PRODUCT_ERROR:", error.reloadly || error);
-    return res.status(error.statusCode || 500).json({ success:false, message:error.message });
-  }
-});
-
-
+);
 
 /* =========================
-   RELOADLY GIFT CARD ORDER
+   RELOADLY GIFTCARDS SEARCH
 ========================= */
 
-app.post("/reloadly/giftcards/orders", requireAuth, async (req, res) => {
-  let debitedUser = null;
-  let chargedAmount = 0;
+app.get(
+  "/reloadly/giftcards",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const search = String(req.query.search || "")
+        .trim()
+        .toLowerCase();
 
-  try {
-    const productId = Number(req.body.productId);
-    const quantity = Math.max(1, Math.min(5, Number(req.body.quantity || 1)));
-    const unitPrice = Number(req.body.unitPrice);
-    const recipientEmail = normalizeEmail(req.body.recipientEmail || req.user.email);
+      const country = String(req.query.country || "")
+        .trim()
+        .toUpperCase();
 
-    if (!Number.isInteger(productId) || productId <= 0) {
-      return res.status(400).json({ success:false, message:"Product ID la pa valab." });
-    }
-    if (!Number.isInteger(quantity) || quantity <= 0) {
-      return res.status(400).json({ success:false, message:"Quantity a pa valab." });
-    }
-    if (!Number.isFinite(unitPrice) || unitPrice <= 0) {
-      return res.status(400).json({ success:false, message:"Pri gift card la pa valab." });
-    }
+      const path = country
+        ? `/countries/${encodeURIComponent(country)}/products?size=200&page=1`
+        : "/products?size=200&page=1";
 
-    const product = await reloadlyRequest(RELOADLY_GIFTCARD_URL, `/products/${productId}`);
-    if (String(product.status || "ACTIVE").toUpperCase() !== "ACTIVE") {
-      return res.status(400).json({ success:false, message:"Gift card sa pa disponib kounye a." });
-    }
+      const data = await reloadlyRequest(
+        "giftcards",
+        path
+      );
 
-    if (String(product.senderCurrencyCode || "USD").toUpperCase() !== "USD") {
-      return res.status(400).json({ success:false, message:"Pwodwi sa pa ka vann ak wallet USD sa pou kounye a." });
-    }
+      let products = Array.isArray(data)
+        ? data
+        : Array.isArray(data.content)
+          ? data.content
+          : [];
 
-    const senderUnitPrice = giftCardSenderUnitPrice(product, unitPrice);
-    if (!Number.isFinite(senderUnitPrice) || senderUnitPrice <= 0) {
-      return res.status(400).json({ success:false, message:"Denomination sa pa valab pou gift card sa." });
-    }
+      if (search) {
+        products = products.filter((product) => {
+          const haystack = [
+            product.productName,
+            product.brand?.brandName,
+            product.country?.name,
+            product.country?.isoName
+          ]
+            .filter(Boolean)
+            .join(" ")
+            .toLowerCase();
 
-    const feePerCard = Number(product.senderFee || 0);
-    chargedAmount = roundMoney((senderUnitPrice + feePerCard) * quantity);
-
-    debitedUser = await User.findOneAndUpdate(
-      { _id:req.user.userId, balance:{ $gte:chargedAmount }, status:"Active" },
-      { $inc:{ balance:-chargedAmount } },
-      { new:true }
-    );
-
-    if (!debitedUser) {
-      return res.status(400).json({ success:false, message:`Balans pa sifi. Acha sa bezwen anviwon $${chargedAmount.toFixed(2)} USD.` });
-    }
-
-    const customIdentifier = `DLM-GIFT-${debitedUser._id}-${Date.now()}`;
-    const data = await reloadlyRequest(RELOADLY_GIFTCARD_URL, "/orders", {
-      method:"POST",
-      headers:{ Accept:"application/com.reloadly.giftcards-v1+json" },
-      body:{
-        productId,
-        quantity,
-        unitPrice,
-        customIdentifier,
-        senderName:debitedUser.name || "DLM Wallet",
-        recipientEmail
+          return haystack.includes(search);
+        });
       }
-    });
 
-    const actualCost = Number(data.amount);
-    if (Number.isFinite(actualCost) && actualCost >= 0 && actualCost < chargedAmount) {
-      const refund = roundMoney(chargedAmount - actualCost);
-      await User.findByIdAndUpdate(debitedUser._id, { $inc:{ balance:refund } });
-      debitedUser.balance = Number(debitedUser.balance) + refund;
-      chargedAmount = actualCost;
+      return res.json({
+        success: true,
+        products
+      });
+
+    } catch (error) {
+      console.error(
+        "RELOADLY_GIFTCARDS_SEARCH_ERROR:",
+        error.reloadly || error
+      );
+
+      return res.status(
+        error.statusCode && error.statusCode < 600
+          ? error.statusCode
+          : 500
+      ).json({
+        success: false,
+        message:
+          error.message ||
+          "Pa rive chaje pwodwi Reloadly yo."
+      });
     }
-
-    await Transaction.create({
-      userId:debitedUser._id,
-      type:"giftcard",
-      amount:roundMoney(chargedAmount),
-      status:"completed",
-      description:`Reloadly gift card ${data.product?.productName || product.productName || productId} - ${data.transactionId || customIdentifier}`,
-      externalId:String(data.transactionId || customIdentifier),
-      metadata:{
-        provider:"Reloadly",
-        productId,
-        productName:data.product?.productName || product.productName || "Gift Card",
-        unitPrice,
-        quantity,
-        recipientEmail,
-        status:data.status || "SUCCESSFUL"
-      }
-    });
-
-    return res.json({
-      success:true,
-      message:"Gift card la achte avèk siksè.",
-      balance:Number(debitedUser.balance),
-      order:{
-        transactionId:data.transactionId,
-        status:data.status,
-        product:data.product,
-        recipientEmail:data.recipientEmail || recipientEmail,
-        amount:roundMoney(chargedAmount)
-      }
-    });
-  } catch (error) {
-    if (debitedUser) {
-      try {
-        await User.findByIdAndUpdate(debitedUser._id, { $inc:{ balance:chargedAmount } });
-      } catch {}
-    }
-    console.error("RELOADLY_GIFTCARD_ORDER_ERROR:", error.reloadly || error);
-    return res.status(error.statusCode || 500).json({
-      success:false,
-      message:error.message || "Acha gift card la echwe; balans kliyan an retounen."
-    });
   }
-});
+);
 
-app.get("/reloadly/giftcards/orders/:transactionId/cards", requireAuth, async (req, res) => {
-  try {
-    const transactionId = String(req.params.transactionId || "").trim();
-    if (!transactionId) return res.status(400).json({ success:false, message:"Transaction ID obligatwa." });
+/* =========================
+   RELOADLY GIFTCARD ORDER
+========================= */
 
-    const owned = await Transaction.findOne({
-      userId:req.user.userId,
-      type:"giftcard",
-      externalId:transactionId
-    });
+app.post(
+  "/reloadly/giftcards/order",
+  requireAuth,
+  async (req, res) => {
+    let chargedUser = null;
+    let total = 0;
 
-    if (!owned) return res.status(404).json({ success:false, message:"Gift card sa pa jwenn sou kont ou." });
+    try {
+      const productId = Number(req.body.productId);
+      const quantity = Math.max(1, Number(req.body.quantity || 1));
+      const unitPrice = Number(req.body.unitPrice || req.body.amount);
+      const countryCode = String(req.body.countryCode || "US")
+        .trim()
+        .toUpperCase();
 
-    const data = await reloadlyRequest(
-      RELOADLY_GIFTCARD_URL,
-      `/orders/transactions/${encodeURIComponent(transactionId)}/cards`,
-      { headers:{ Accept:"application/com.reloadly.giftcards-v2+json" } }
-    );
+      const recipientEmail = normalizeEmail(
+        req.body.recipientEmail || req.user.email
+      );
 
-    return res.json({ success:true, cards:data });
-  } catch (error) {
-    console.error("RELOADLY_GIFTCARD_CODES_ERROR:", error.reloadly || error);
-    return res.status(error.statusCode || 500).json({ success:false, message:error.message || "Pa rive chaje gift card code la." });
+      if (
+        !Number.isInteger(productId) ||
+        productId <= 0 ||
+        !Number.isFinite(quantity) ||
+        quantity <= 0 ||
+        !Number.isFinite(unitPrice) ||
+        unitPrice <= 0
+      ) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "productId, quantity ak unitPrice/amount dwe valab."
+        });
+      }
+
+      total = Number((quantity * unitPrice).toFixed(2));
+
+      chargedUser = await deductCustomerBalance(
+        req.user.userId,
+        total
+      );
+
+      if (!chargedUser) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Balans pa sifi oswa kont lan pa aktif."
+        });
+      }
+
+      const customIdentifier =
+        `dlm-gc-${req.user.userId}-${Date.now()}`;
+
+      const order = await reloadlyRequest(
+        "giftcards",
+        "/orders",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            productId,
+            countryCode,
+            quantity,
+            unitPrice,
+            customIdentifier,
+            senderName: chargedUser.name || "DLM Wallet",
+            recipientEmail
+          })
+        }
+      );
+
+      await Transaction.create({
+        userId: chargedUser._id,
+        type: "giftcard",
+        amount: total,
+        status: "completed",
+        description:
+          `Reloadly gift card order ${order.transactionId || customIdentifier}`
+      });
+
+      const reserve = await reduceCustomerLiability(total);
+
+      return res.json({
+        success: true,
+        message:
+          "Gift card la achte avèk siksè.",
+        order,
+        balance: Number(chargedUser.balance),
+        reserve: reserveView(reserve)
+      });
+
+    } catch (error) {
+      if (chargedUser && total > 0) {
+        await refundCustomerBalance(
+          chargedUser._id,
+          total
+        ).catch(() => null);
+      }
+
+      console.error(
+        "RELOADLY_GIFTCARD_ORDER_ERROR:",
+        error.reloadly || error
+      );
+
+      return res.status(
+        error.statusCode && error.statusCode < 600
+          ? error.statusCode
+          : 500
+      ).json({
+        success: false,
+        message:
+          error.message ||
+          "Gift card la pa rive achte. Balans kliyan an pa pèdi."
+      });
+    }
   }
-});
+);
+
+/* =========================
+   RELOADLY REDEEM CODE
+========================= */
+
+app.get(
+  "/reloadly/giftcards/orders/:transactionId/cards",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const transactionId = String(req.params.transactionId || "").trim();
+
+      if (!transactionId) {
+        return res.status(400).json({
+          success: false,
+          message: "transactionId obligatwa."
+        });
+      }
+
+      const cards = await reloadlyRequest(
+        "giftcards",
+        `/orders/transactions/${encodeURIComponent(transactionId)}/cards`,
+        {
+          headers: {
+            Accept: "application/com.reloadly.giftcards-v2+json"
+          }
+        }
+      );
+
+      return res.json({
+        success: true,
+        cards
+      });
+
+    } catch (error) {
+      return res.status(
+        error.statusCode && error.statusCode < 600
+          ? error.statusCode
+          : 500
+      ).json({
+        success: false,
+        message:
+          error.message ||
+          "Pa rive jwenn redeem code la."
+      });
+    }
+  }
+);
+
+/* =========================
+   RELOADLY AIRTIME TOPUP
+========================= */
+
+app.post(
+  "/reloadly/topup",
+  requireAuth,
+  async (req, res) => {
+    let chargedUser = null;
+    let amount = 0;
+
+    try {
+      amount = Number(req.body.amount);
+      const countryCode = String(req.body.countryCode || "")
+        .trim()
+        .toUpperCase();
+      const phone = normalizePhone(req.body.phone);
+
+      if (
+        !Number.isFinite(amount) ||
+        amount <= 0 ||
+        !/^[A-Z]{2}$/.test(countryCode) ||
+        phone.length < 6
+      ) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Nimewo, country code ak montan topup la pa valab."
+        });
+      }
+
+      const operator = await reloadlyRequest(
+        "airtime",
+        `/operators/auto-detect/phone/${encodeURIComponent(phone)}/countries/${encodeURIComponent(countryCode)}`
+      );
+
+      const operatorId = Number(operator.operatorId || operator.id);
+
+      if (!Number.isInteger(operatorId) || operatorId <= 0) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Reloadly pa rive detekte operatè nimewo sa."
+        });
+      }
+
+      chargedUser = await deductCustomerBalance(
+        req.user.userId,
+        amount
+      );
+
+      if (!chargedUser) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Balans pa sifi oswa kont lan pa aktif."
+        });
+      }
+
+      const customIdentifier =
+        `dlm-topup-${req.user.userId}-${Date.now()}`;
+
+      const topup = await reloadlyRequest(
+        "airtime",
+        "/topups",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            operatorId,
+            amount,
+            useLocalAmount: false,
+            customIdentifier,
+            recipientPhone: {
+              countryCode,
+              number: phone
+            }
+          })
+        }
+      );
+
+      await Transaction.create({
+        userId: chargedUser._id,
+        type: "topup",
+        amount,
+        status: "completed",
+        description:
+          `Reloadly topup ${topup.transactionId || customIdentifier} - ${countryCode} ${phone}`
+      });
+
+      const reserve = await reduceCustomerLiability(amount);
+
+      return res.json({
+        success: true,
+        message:
+          "Topup la voye avèk siksè.",
+        operator: {
+          operatorId,
+          name: operator.name || operator.operatorName || ""
+        },
+        topup,
+        balance: Number(chargedUser.balance),
+        reserve: reserveView(reserve)
+      });
+
+    } catch (error) {
+      if (chargedUser && amount > 0) {
+        await refundCustomerBalance(
+          chargedUser._id,
+          amount
+        ).catch(() => null);
+      }
+
+      console.error(
+        "RELOADLY_TOPUP_ERROR:",
+        error.reloadly || error
+      );
+
+      return res.status(
+        error.statusCode && error.statusCode < 600
+          ? error.statusCode
+          : 500
+      ).json({
+        success: false,
+        message:
+          error.message ||
+          "Topup la echwe. Balans kliyan an pa pèdi."
+      });
+    }
+  }
+);
 
 /* =========================
    404 HANDLER
