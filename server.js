@@ -931,6 +931,14 @@ app.post(
           });
       }
 
+      if (
+        email === ADMIN_EMAIL &&
+        user.role !== "admin"
+      ) {
+        user.role = "admin";
+        await user.save();
+      }
+
       const isMatch =
         await bcrypt.compare(
           password,
