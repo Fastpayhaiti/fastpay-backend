@@ -274,7 +274,7 @@ const serviceOrderSchema = new mongoose.Schema(
     },
     paymentMethod: {
       type: String,
-      enum: ["wallet", "MonCash", "NatCash"],
+      enum: ["wallet", "card"],
       required: true
     },
     paymentReference: {
@@ -2712,20 +2712,19 @@ app.post(
         });
       }
 
-      if (!["wallet", "MonCash", "NatCash"].includes(paymentMethod)) {
+      if (!["wallet", "card"].includes(paymentMethod)) {
         return res.status(400).json({
           success: false,
           message: "Metòd peman an pa valab."
         });
       }
 
-      if (
-        ["MonCash", "NatCash"].includes(paymentMethod) &&
-        !paymentReference
-      ) {
-        return res.status(400).json({
+
+      if (paymentMethod === "card") {
+        return res.status(503).json({
           success: false,
-          message: "Reference peman an obligatwa."
+          message:
+            "Peman pa kat poko aktive. Sèvi ak DLM Wallet pou kounye a."
         });
       }
 
