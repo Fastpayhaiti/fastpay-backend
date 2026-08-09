@@ -274,7 +274,8 @@ const serviceOrderSchema = new mongoose.Schema(
     },
     paymentMethod: {
       type: String,
-      enum: ["wallet", "card"],
+      enum: ["wallet"],
+      default: "wallet",
       required: true
     },
     paymentReference: {
@@ -2695,7 +2696,7 @@ app.post(
       const service = String(req.body.service || "").trim();
       const plan = String(req.body.plan || "").trim();
       const amount = Number(req.body.amount);
-      const paymentMethod = String(req.body.paymentMethod || "").trim();
+      const paymentMethod = "wallet";
       const paymentReference = String(req.body.paymentReference || "").trim();
 
       if (!["Netflix", "Prime Video"].includes(service)) {
@@ -2709,22 +2710,6 @@ app.post(
         return res.status(400).json({
           success: false,
           message: "Plan ak montan an obligatwa."
-        });
-      }
-
-      if (!["wallet", "card"].includes(paymentMethod)) {
-        return res.status(400).json({
-          success: false,
-          message: "Metòd peman an pa valab."
-        });
-      }
-
-
-      if (paymentMethod === "card") {
-        return res.status(503).json({
-          success: false,
-          message:
-            "Peman pa kat poko aktive. Sèvi ak DLM Wallet pou kounye a."
         });
       }
 
