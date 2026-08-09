@@ -160,6 +160,15 @@ const transactionSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: "User",
       default: null
+    },
+    externalId: {
+      type: String,
+      default: null,
+      index: true
+    },
+    metadata: {
+      type: mongoose.Schema.Types.Mixed,
+      default: null
     }
   },
   { timestamps: true }
@@ -2149,6 +2158,41 @@ async function reloadlyRequest(baseUrl, path, options = {}) {
   return data;
 }
 
+
+function roundMoney(value) {
+  return Math.round((Number(value) + Number.EPSILON) * 100) / 100;
+}
+
+function giftCardSenderUnitPrice(product, unitPrice) {
+  const recipientPrice = Number(unitPrice);
+  if (!Number.isFinite(recipientPrice) || recipientPrice <= 0) return null;
+
+  if (String(product.denominationType || "").toUpperCase() === "FIXED") {
+    const allowed = Array.isArray(product.fixedRecipientDenominations)
+      ? product.fixedRecipientDenominations.map(Number)
+      : [];
+    if (!allowed.some(v => Math.abs(v - recipientPrice) < 0.001)) return null;
+
+    const maps = Array.isArray(product.fixedRecipientToSenderDenominationsMap)
+      ? product.fixedRecipientToSenderDenominationsMap
+      : [];
+    for (const entry of maps) {
+      if (!entry || typeof entry !== "object") continue;
+      for (const [k, v] of Object.entries(entry)) {
+        if (Math.abs(Number(k) - recipientPrice) < 0.001) return Number(v);
+      }
+    }
+  } else {
+    const min = Number(product.minRecipientDenomination || 0);
+    const max = Number(product.maxRecipientDenomination || product.maxrecipientDenomination || 0);
+    if (min && recipientPrice < min) return null;
+    if (max && recipientPrice > max) return null;
+  }
+
+  const rate = Number(product.recipientCurrencyToSenderCurrencyExchangeRate || 1);
+  return recipientPrice * rate;
+}
+
 app.get("/reloadly/status", requireAuth, async (_req, res) => {
   return res.json({
     success: true,
@@ -2220,7 +2264,13 @@ app.post("/reloadly/topups", requireAuth, async (req, res) => {
       type:"topup",
       amount,
       status:"completed",
-      description:`Reloadly topup ${countryCode} ${number} - ${data.transactionId || customIdentifier}`
+      description:`Reloadly topup ${countryCode} ${number} - ${data.transactionId || customIdentifier}`,
+      externalId:String(data.transactionId || customIdentifier),
+      metadata:{
+        provider:"Reloadly",
+        operatorName:data.operatorName || "",
+        recipientPhone:data.recipientPhone || `${countryCode}${number}`
+      }
     });
 
     return res.json({
@@ -2267,6 +2317,151 @@ app.get("/reloadly/giftcards/products/:productId", requireAuth, async (req, res)
   } catch (error) {
     console.error("RELOADLY_GIFTCARD_PRODUCT_ERROR:", error.reloadly || error);
     return res.status(error.statusCode || 500).json({ success:false, message:error.message });
+  }
+});
+
+
+
+/* =========================
+   RELOADLY GIFT CARD ORDER
+========================= */
+
+app.post("/reloadly/giftcards/orders", requireAuth, async (req, res) => {
+  let debitedUser = null;
+  let chargedAmount = 0;
+
+  try {
+    const productId = Number(req.body.productId);
+    const quantity = Math.max(1, Math.min(5, Number(req.body.quantity || 1)));
+    const unitPrice = Number(req.body.unitPrice);
+    const recipientEmail = normalizeEmail(req.body.recipientEmail || req.user.email);
+
+    if (!Number.isInteger(productId) || productId <= 0) {
+      return res.status(400).json({ success:false, message:"Product ID la pa valab." });
+    }
+    if (!Number.isInteger(quantity) || quantity <= 0) {
+      return res.status(400).json({ success:false, message:"Quantity a pa valab." });
+    }
+    if (!Number.isFinite(unitPrice) || unitPrice <= 0) {
+      return res.status(400).json({ success:false, message:"Pri gift card la pa valab." });
+    }
+
+    const product = await reloadlyRequest(RELOADLY_GIFTCARD_URL, `/products/${productId}`);
+    if (String(product.status || "ACTIVE").toUpperCase() !== "ACTIVE") {
+      return res.status(400).json({ success:false, message:"Gift card sa pa disponib kounye a." });
+    }
+
+    if (String(product.senderCurrencyCode || "USD").toUpperCase() !== "USD") {
+      return res.status(400).json({ success:false, message:"Pwodwi sa pa ka vann ak wallet USD sa pou kounye a." });
+    }
+
+    const senderUnitPrice = giftCardSenderUnitPrice(product, unitPrice);
+    if (!Number.isFinite(senderUnitPrice) || senderUnitPrice <= 0) {
+      return res.status(400).json({ success:false, message:"Denomination sa pa valab pou gift card sa." });
+    }
+
+    const feePerCard = Number(product.senderFee || 0);
+    chargedAmount = roundMoney((senderUnitPrice + feePerCard) * quantity);
+
+    debitedUser = await User.findOneAndUpdate(
+      { _id:req.user.userId, balance:{ $gte:chargedAmount }, status:"Active" },
+      { $inc:{ balance:-chargedAmount } },
+      { new:true }
+    );
+
+    if (!debitedUser) {
+      return res.status(400).json({ success:false, message:`Balans pa sifi. Acha sa bezwen anviwon $${chargedAmount.toFixed(2)} USD.` });
+    }
+
+    const customIdentifier = `DLM-GIFT-${debitedUser._id}-${Date.now()}`;
+    const data = await reloadlyRequest(RELOADLY_GIFTCARD_URL, "/orders", {
+      method:"POST",
+      headers:{ Accept:"application/com.reloadly.giftcards-v1+json" },
+      body:{
+        productId,
+        quantity,
+        unitPrice,
+        customIdentifier,
+        senderName:debitedUser.name || "DLM Wallet",
+        recipientEmail
+      }
+    });
+
+    const actualCost = Number(data.amount);
+    if (Number.isFinite(actualCost) && actualCost >= 0 && actualCost < chargedAmount) {
+      const refund = roundMoney(chargedAmount - actualCost);
+      await User.findByIdAndUpdate(debitedUser._id, { $inc:{ balance:refund } });
+      debitedUser.balance = Number(debitedUser.balance) + refund;
+      chargedAmount = actualCost;
+    }
+
+    await Transaction.create({
+      userId:debitedUser._id,
+      type:"giftcard",
+      amount:roundMoney(chargedAmount),
+      status:"completed",
+      description:`Reloadly gift card ${data.product?.productName || product.productName || productId} - ${data.transactionId || customIdentifier}`,
+      externalId:String(data.transactionId || customIdentifier),
+      metadata:{
+        provider:"Reloadly",
+        productId,
+        productName:data.product?.productName || product.productName || "Gift Card",
+        unitPrice,
+        quantity,
+        recipientEmail,
+        status:data.status || "SUCCESSFUL"
+      }
+    });
+
+    return res.json({
+      success:true,
+      message:"Gift card la achte avèk siksè.",
+      balance:Number(debitedUser.balance),
+      order:{
+        transactionId:data.transactionId,
+        status:data.status,
+        product:data.product,
+        recipientEmail:data.recipientEmail || recipientEmail,
+        amount:roundMoney(chargedAmount)
+      }
+    });
+  } catch (error) {
+    if (debitedUser) {
+      try {
+        await User.findByIdAndUpdate(debitedUser._id, { $inc:{ balance:chargedAmount } });
+      } catch {}
+    }
+    console.error("RELOADLY_GIFTCARD_ORDER_ERROR:", error.reloadly || error);
+    return res.status(error.statusCode || 500).json({
+      success:false,
+      message:error.message || "Acha gift card la echwe; balans kliyan an retounen."
+    });
+  }
+});
+
+app.get("/reloadly/giftcards/orders/:transactionId/cards", requireAuth, async (req, res) => {
+  try {
+    const transactionId = String(req.params.transactionId || "").trim();
+    if (!transactionId) return res.status(400).json({ success:false, message:"Transaction ID obligatwa." });
+
+    const owned = await Transaction.findOne({
+      userId:req.user.userId,
+      type:"giftcard",
+      externalId:transactionId
+    });
+
+    if (!owned) return res.status(404).json({ success:false, message:"Gift card sa pa jwenn sou kont ou." });
+
+    const data = await reloadlyRequest(
+      RELOADLY_GIFTCARD_URL,
+      `/orders/transactions/${encodeURIComponent(transactionId)}/cards`,
+      { headers:{ Accept:"application/com.reloadly.giftcards-v2+json" } }
+    );
+
+    return res.json({ success:true, cards:data });
+  } catch (error) {
+    console.error("RELOADLY_GIFTCARD_CODES_ERROR:", error.reloadly || error);
+    return res.status(error.statusCode || 500).json({ success:false, message:error.message || "Pa rive chaje gift card code la." });
   }
 });
 
