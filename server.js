@@ -1407,6 +1407,56 @@ app.get(
 );
 
 
+
+/* =========================
+   ADMIN ALL TRANSACTIONS
+========================= */
+
+app.get(
+  "/admin/transactions",
+  requireAuth,
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const type = String(req.query.type || "").trim();
+      const status = String(req.query.status || "").trim();
+      const userId = String(req.query.userId || "").trim();
+
+      const filter = {};
+
+      if (type) {
+        filter.type = type;
+      }
+
+      if (status) {
+        filter.status = status;
+      }
+
+      if (userId && mongoose.Types.ObjectId.isValid(userId)) {
+        filter.userId = userId;
+      }
+
+      const transactions = await Transaction.find(filter)
+        .populate("userId", "name email phone balance status")
+        .populate("createdBy", "name email")
+        .sort({ createdAt: -1 })
+        .limit(500);
+
+      return res.json({
+        success: true,
+        transactions
+      });
+    } catch (error) {
+      console.error("ADMIN_TRANSACTIONS_ERROR:", error);
+
+      return res.status(500).json({
+        success: false,
+        message: "Pa rive chaje tout tranzaksyon yo."
+      });
+    }
+  }
+);
+
 /* =========================
    ADMIN USERS
 ========================= */
