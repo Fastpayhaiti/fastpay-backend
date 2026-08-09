@@ -136,7 +136,9 @@ const transactionSchema = new mongoose.Schema(
         "withdraw",
         "transfer",
         "admin_credit",
-        "admin_debit"
+        "admin_debit",
+        "topup",
+        "giftcard"
       ],
       required: true
     },
@@ -2066,6 +2068,207 @@ app.get(
     }
   }
 );
+
+
+/* =========================
+   RELOADLY INTEGRATION
+   Airtime topups + Gift Card catalog
+========================= */
+
+const RELOADLY_MODE = String(process.env.RELOADLY_MODE || "sandbox").trim().toLowerCase();
+const RELOADLY_CLIENT_ID = String(process.env.RELOADLY_CLIENT_ID || "").trim();
+const RELOADLY_CLIENT_SECRET = String(process.env.RELOADLY_CLIENT_SECRET || "").trim();
+const RELOADLY_AIRTIME_URL = RELOADLY_MODE === "live"
+  ? "https://topups.reloadly.com"
+  : "https://topups-sandbox.reloadly.com";
+const RELOADLY_GIFTCARD_URL = RELOADLY_MODE === "live"
+  ? "https://giftcards.reloadly.com"
+  : "https://giftcards-sandbox.reloadly.com";
+
+const reloadlyTokenCache = new Map();
+
+function reloadlyConfigured() {
+  return Boolean(RELOADLY_CLIENT_ID && RELOADLY_CLIENT_SECRET);
+}
+
+async function reloadlyToken(audience) {
+  if (!reloadlyConfigured()) {
+    const e = new Error("Reloadly poko configure sou Render. Mete RELOADLY_CLIENT_ID ak RELOADLY_CLIENT_SECRET.");
+    e.statusCode = 503;
+    throw e;
+  }
+
+  const cached = reloadlyTokenCache.get(audience);
+  if (cached && cached.expiresAt > Date.now() + 60000) return cached.token;
+
+  const response = await fetch("https://auth.reloadly.com/oauth/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      client_id: RELOADLY_CLIENT_ID,
+      client_secret: RELOADLY_CLIENT_SECRET,
+      grant_type: "client_credentials",
+      audience
+    })
+  });
+
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || !data.access_token) {
+    const e = new Error(data.message || data.error_description || "Reloadly authentication echwe.");
+    e.statusCode = 502;
+    throw e;
+  }
+
+  reloadlyTokenCache.set(audience, {
+    token: data.access_token,
+    expiresAt: Date.now() + Math.max(60, Number(data.expires_in || 3600)) * 1000
+  });
+  return data.access_token;
+}
+
+async function reloadlyRequest(baseUrl, path, options = {}) {
+  const token = await reloadlyToken(baseUrl);
+  const response = await fetch(`${baseUrl}${path}`, {
+    method: options.method || "GET",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      ...(options.headers || {})
+    },
+    body: options.body ? JSON.stringify(options.body) : undefined
+  });
+
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const e = new Error(data.message || data.errorCode || `Reloadly request echwe (${response.status}).`);
+    e.statusCode = response.status >= 400 && response.status < 500 ? 400 : 502;
+    e.reloadly = data;
+    throw e;
+  }
+  return data;
+}
+
+app.get("/reloadly/status", requireAuth, async (_req, res) => {
+  return res.json({
+    success: true,
+    configured: reloadlyConfigured(),
+    mode: RELOADLY_MODE === "live" ? "live" : "sandbox",
+    airtime: true,
+    giftCardsCatalog: true
+  });
+});
+
+app.get("/reloadly/operators/countries/:countryCode", requireAuth, async (req, res) => {
+  try {
+    const countryCode = String(req.params.countryCode || "").trim().toUpperCase();
+    if (!/^[A-Z]{2}$/.test(countryCode)) return res.status(400).json({ success:false, message:"Country code la pa valab." });
+    const data = await reloadlyRequest(RELOADLY_AIRTIME_URL, `/operators/countries/${encodeURIComponent(countryCode)}?includeBundles=true&includeData=true&includePin=true&suggestedAmounts=true&suggestedAmountsMap=true`);
+    return res.json({ success:true, operators:data });
+  } catch (error) {
+    console.error("RELOADLY_OPERATORS_ERROR:", error.reloadly || error);
+    return res.status(error.statusCode || 500).json({ success:false, message:error.message });
+  }
+});
+
+app.get("/reloadly/operators/auto-detect", requireAuth, async (req, res) => {
+  try {
+    const phone = String(req.query.phone || "").replace(/[^0-9+]/g, "");
+    const countryCode = String(req.query.countryCode || "HT").trim().toUpperCase();
+    if (!phone) return res.status(400).json({ success:false, message:"Nimewo telefòn lan obligatwa." });
+    const data = await reloadlyRequest(RELOADLY_AIRTIME_URL, `/operators/auto-detect/phone/${encodeURIComponent(phone)}/countries/${encodeURIComponent(countryCode)}?suggestedAmounts=true&suggestedAmountsMap=true`);
+    return res.json({ success:true, operator:data });
+  } catch (error) {
+    console.error("RELOADLY_AUTODETECT_ERROR:", error.reloadly || error);
+    return res.status(error.statusCode || 500).json({ success:false, message:error.message });
+  }
+});
+
+app.post("/reloadly/topups", requireAuth, async (req, res) => {
+  let debitedUser = null;
+  try {
+    const amount = Number(req.body.amount);
+    const operatorId = Number(req.body.operatorId);
+    const countryCode = String(req.body.countryCode || "HT").trim().toUpperCase();
+    const number = String(req.body.number || "").replace(/[^0-9]/g, "");
+
+    if (!Number.isFinite(amount) || amount <= 0) return res.status(400).json({ success:false, message:"Montan topup la pa valab." });
+    if (!Number.isInteger(operatorId) || operatorId <= 0) return res.status(400).json({ success:false, message:"Operator ID la pa valab." });
+    if (!/^[A-Z]{2}$/.test(countryCode) || !number) return res.status(400).json({ success:false, message:"Country code oswa nimewo telefòn lan pa valab." });
+
+    debitedUser = await User.findOneAndUpdate(
+      { _id:req.user.userId, balance:{ $gte:amount }, status:"Active" },
+      { $inc:{ balance:-amount } },
+      { new:true }
+    );
+    if (!debitedUser) return res.status(400).json({ success:false, message:"Balans pa sifi oswa kont lan pa aktif." });
+
+    const customIdentifier = `DLM-TOPUP-${debitedUser._id}-${Date.now()}`;
+    const data = await reloadlyRequest(RELOADLY_AIRTIME_URL, "/topups", {
+      method:"POST",
+      body:{
+        operatorId,
+        amount,
+        useLocalAmount:false,
+        customIdentifier,
+        recipientPhone:{ countryCode, number }
+      }
+    });
+
+    await Transaction.create({
+      userId:debitedUser._id,
+      type:"topup",
+      amount,
+      status:"completed",
+      description:`Reloadly topup ${countryCode} ${number} - ${data.transactionId || customIdentifier}`
+    });
+
+    return res.json({
+      success:true,
+      message:"Topup la voye avèk siksè.",
+      balance:Number(debitedUser.balance),
+      topup:{
+        transactionId:data.transactionId,
+        status:data.status,
+        operatorName:data.operatorName,
+        recipientPhone:data.recipientPhone,
+        deliveredAmount:data.deliveredAmount,
+        deliveredAmountCurrencyCode:data.deliveredAmountCurrencyCode
+      }
+    });
+  } catch (error) {
+    if (debitedUser) {
+      try { await User.findByIdAndUpdate(debitedUser._id, { $inc:{ balance:Number(req.body.amount || 0) } }); } catch {}
+    }
+    console.error("RELOADLY_TOPUP_ERROR:", error.reloadly || error);
+    return res.status(error.statusCode || 500).json({ success:false, message:error.message || "Topup la echwe; balans kliyan an retounen." });
+  }
+});
+
+app.get("/reloadly/giftcards/products", requireAuth, async (req, res) => {
+  try {
+    const countryCode = String(req.query.countryCode || "US").trim().toUpperCase();
+    const size = Math.min(100, Math.max(1, Number(req.query.size || 50)));
+    const page = Math.max(1, Number(req.query.page || 1));
+    const data = await reloadlyRequest(RELOADLY_GIFTCARD_URL, `/products?countryCode=${encodeURIComponent(countryCode)}&size=${size}&page=${page}`);
+    return res.json({ success:true, products:data });
+  } catch (error) {
+    console.error("RELOADLY_GIFTCARDS_ERROR:", error.reloadly || error);
+    return res.status(error.statusCode || 500).json({ success:false, message:error.message });
+  }
+});
+
+app.get("/reloadly/giftcards/products/:productId", requireAuth, async (req, res) => {
+  try {
+    const productId = Number(req.params.productId);
+    if (!Number.isInteger(productId) || productId <= 0) return res.status(400).json({ success:false, message:"Product ID la pa valab." });
+    const data = await reloadlyRequest(RELOADLY_GIFTCARD_URL, `/products/${productId}`);
+    return res.json({ success:true, product:data });
+  } catch (error) {
+    console.error("RELOADLY_GIFTCARD_PRODUCT_ERROR:", error.reloadly || error);
+    return res.status(error.statusCode || 500).json({ success:false, message:error.message });
+  }
+});
 
 /* =========================
    404 HANDLER
