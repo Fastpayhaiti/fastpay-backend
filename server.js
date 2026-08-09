@@ -3,6 +3,7 @@ const mongoose = require("mongoose");
 const cors = require("cors");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
+const crypto = require("crypto");
 require("dotenv").config();
 
 const app = express();
@@ -32,7 +33,7 @@ app.use(
       );
     },
     methods: ["GET", "POST", "PATCH", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"]
+    allowedHeaders: ["Content-Type", "Authorization", "X-DLM-PIN-Token"]
   })
 );
 
@@ -115,6 +116,37 @@ const userSchema = new mongoose.Schema(
       default: false
     },
     pinUpdatedAt: {
+      type: Date,
+      default: null
+    },
+    pinFailedAttempts: {
+      type: Number,
+      default: 0,
+      min: 0
+    },
+    pinLockedUntil: {
+      type: Date,
+      default: null
+    },
+    pinVersion: {
+      type: Number,
+      default: 0,
+      min: 0
+    },
+    authVersion: {
+      type: Number,
+      default: 0,
+      min: 0
+    },
+    passwordResetTokenHash: {
+      type: String,
+      default: null
+    },
+    passwordResetExpiresAt: {
+      type: Date,
+      default: null
+    },
+    passwordResetRequestedAt: {
       type: Date,
       default: null
     }
@@ -406,19 +438,17 @@ function createToken(user) {
     {
       userId: user._id.toString(),
       email: user.email,
-      role: user.role
+      role: user.role,
+      authVersion: Number(user.authVersion || 0)
     },
     process.env.JWT_SECRET,
     { expiresIn: "12h" }
   );
 }
 
-function requireAuth(req, res, next) {
-  const header =
-    req.headers.authorization || "";
-
-  const [type, token] =
-    header.split(" ");
+async function requireAuth(req, res, next) {
+  const header = req.headers.authorization || "";
+  const [type, token] = header.split(" ");
 
   if (type !== "Bearer" || !token) {
     return res.status(401).json({
@@ -428,10 +458,37 @@ function requireAuth(req, res, next) {
   }
 
   try {
-    req.user = jwt.verify(
+    const decoded = jwt.verify(
       token,
       process.env.JWT_SECRET
     );
+
+    const user = await User.findById(
+      decoded.userId
+    ).select(
+      "_id email role status authVersion"
+    );
+
+    if (
+      !user ||
+      user.status !== "Active" ||
+      Number(decoded.authVersion || 0) !==
+        Number(user.authVersion || 0)
+    ) {
+      return res.status(401).json({
+        success: false,
+        message:
+          "Session lan ekspire. Konekte ankò."
+      });
+    }
+
+    req.user = {
+      userId: user._id.toString(),
+      email: user.email,
+      role: user.role,
+      authVersion: Number(user.authVersion || 0)
+    };
+
     return next();
   } catch {
     return res.status(401).json({
@@ -454,6 +511,207 @@ function requireAdmin(req, res, next) {
   }
 
   return next();
+}
+
+
+/* =========================
+   SECURITY HELPERS
+========================= */
+
+const PIN_MAX_ATTEMPTS = 5;
+const PIN_LOCK_MINUTES = 15;
+const PIN_TOKEN_TTL = "10m";
+const PASSWORD_RESET_MINUTES = 15;
+
+const COMMON_PINS = new Set([
+  "000000",
+  "111111",
+  "123456",
+  "654321",
+  "121212",
+  "112233",
+  "123123",
+  "101010",
+  "222222",
+  "333333",
+  "444444",
+  "555555",
+  "666666",
+  "777777",
+  "888888",
+  "999999"
+]);
+
+function validatePin(pin) {
+  const value = String(pin || "");
+
+  if (!/^\d{6}$/.test(value)) {
+    return {
+      ok: false,
+      message: "PIN lan dwe gen egzakteman 6 chif."
+    };
+  }
+
+  if (COMMON_PINS.has(value)) {
+    return {
+      ok: false,
+      message: "Chwazi yon PIN ki pi difisil."
+    };
+  }
+
+  return { ok: true };
+}
+
+function validateNewPassword(password) {
+  const value = String(password || "");
+
+  if (value.length < 10) {
+    return {
+      ok: false,
+      message:
+        "Nouvo modpas la dwe gen omwen 10 karaktè."
+    };
+  }
+
+  if (value.length > 128) {
+    return {
+      ok: false,
+      message: "Modpas la twò long."
+    };
+  }
+
+  return { ok: true };
+}
+
+function createPinToken(user) {
+  return jwt.sign(
+    {
+      type: "pin_unlock",
+      userId: user._id.toString(),
+      pinVersion: Number(user.pinVersion || 0)
+    },
+    process.env.JWT_SECRET,
+    { expiresIn: PIN_TOKEN_TTL }
+  );
+}
+
+async function requirePinUnlock(req, res, next) {
+  try {
+    const pinToken = String(
+      req.headers["x-dlm-pin-token"] || ""
+    ).trim();
+
+    if (!pinToken) {
+      return res.status(428).json({
+        success: false,
+        code: "PIN_REQUIRED",
+        message: "Debloke kont lan ak PIN ou."
+      });
+    }
+
+    const decoded = jwt.verify(
+      pinToken,
+      process.env.JWT_SECRET
+    );
+
+    if (
+      decoded.type !== "pin_unlock" ||
+      decoded.userId !== req.user.userId
+    ) {
+      return res.status(401).json({
+        success: false,
+        code: "PIN_INVALID",
+        message: "PIN session lan pa valab."
+      });
+    }
+
+    const user = await User.findById(
+      req.user.userId
+    ).select(
+      "pinEnabled pinVersion status"
+    );
+
+    if (
+      !user ||
+      user.status !== "Active" ||
+      !user.pinEnabled ||
+      Number(decoded.pinVersion || 0) !==
+        Number(user.pinVersion || 0)
+    ) {
+      return res.status(401).json({
+        success: false,
+        code: "PIN_INVALID",
+        message: "PIN session lan ekspire."
+      });
+    }
+
+    return next();
+  } catch {
+    return res.status(401).json({
+      success: false,
+      code: "PIN_INVALID",
+      message: "PIN session lan ekspire."
+    });
+  }
+}
+
+async function sendPasswordResetEmail(user, rawToken) {
+  const apiKey = String(
+    process.env.RESEND_API_KEY || ""
+  ).trim();
+
+  const from = String(
+    process.env.PASSWORD_RESET_FROM ||
+    "DLM Wallet <security@dlmwallet.com>"
+  ).trim();
+
+  if (!apiKey) {
+    throw new Error(
+      "PASSWORD_EMAIL_NOT_CONFIGURED"
+    );
+  }
+
+  const resetUrl =
+    `${String(
+      process.env.FRONTEND_ORIGIN ||
+      "https://dlmwallet.com"
+    ).replace(/\/$/, "")}` +
+    `/reset-password.html?token=${encodeURIComponent(rawToken)}`;
+
+  const response = await fetch(
+    "https://api.resend.com/emails",
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+        "User-Agent": "DLM-Wallet/1.0"
+      },
+      body: JSON.stringify({
+        from,
+        to: [user.email],
+        subject: "Reset your DLM Wallet password",
+        html:
+          `<div style="font-family:Arial,sans-serif;line-height:1.6">` +
+          `<h2>DLM Wallet Security</h2>` +
+          `<p>Nou resevwa yon demann pou reset modpas ou.</p>` +
+          `<p><a href="${resetUrl}">Reset password</a></p>` +
+          `<p>Lyen sa ap ekspire nan ${PASSWORD_RESET_MINUTES} minit.</p>` +
+          `<p>Si se pa ou, inyore mesaj sa.</p>` +
+          `</div>`
+      })
+    }
+  );
+
+  if (!response.ok) {
+    const details =
+      await response.text().catch(() => "");
+    throw new Error(
+      `PASSWORD_EMAIL_FAILED ${response.status} ${details}`
+    );
+  }
+
+  return true;
 }
 
 async function getOrCreateReserve(
@@ -1137,6 +1395,7 @@ app.get(
 app.post(
   "/withdraw",
   requireAuth,
+  requirePinUnlock,
   async (req, res) => {
     try {
       const amount =
@@ -1236,6 +1495,7 @@ balance: Number(user.balance)
 app.post(
   "/transfer",
   requireAuth,
+  requirePinUnlock,
   async (req, res) => {
     try {
       const amount = Number(req.body.amount);
@@ -2464,6 +2724,7 @@ app.get(
 app.post(
   "/reloadly/giftcards/order",
   requireAuth,
+  requirePinUnlock,
   async (req, res) => {
     let chargedUser = null;
     let total = 0;
@@ -2641,6 +2902,7 @@ app.get(
 app.post(
   "/reloadly/topup",
   requireAuth,
+  requirePinUnlock,
   async (req, res) => {
     let chargedUser = null;
     let amount = 0;
@@ -2774,6 +3036,7 @@ app.post(
 app.post(
   "/service-orders",
   requireAuth,
+  requirePinUnlock,
   async (req, res) => {
     try {
       const service = String(req.body.service || "").trim();
@@ -3294,6 +3557,612 @@ app.patch("/admin/card-requests/:id", requireAuth, requireAdmin, async (req, res
     return res.status(500).json({ success: false, message: "Pa rive trete demann kat la." });
   }
 });
+
+
+/* =========================
+   PIN SECURITY
+========================= */
+
+app.get(
+  "/pin/status",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const user = await User.findById(
+        req.user.userId
+      ).select(
+        "pinEnabled pinLockedUntil pinFailedAttempts"
+      );
+
+      return res.json({
+        success: true,
+        pinEnabled: Boolean(user?.pinEnabled),
+        lockedUntil: user?.pinLockedUntil || null,
+        failedAttempts:
+          Number(user?.pinFailedAttempts || 0)
+      });
+    } catch {
+      return res.status(500).json({
+        success: false,
+        message: "Pa rive chaje PIN status la."
+      });
+    }
+  }
+);
+
+app.post(
+  "/pin/setup",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const pin = String(req.body.pin || "");
+      const currentPassword = String(
+        req.body.currentPassword || ""
+      );
+
+      const pinCheck = validatePin(pin);
+
+      if (!pinCheck.ok) {
+        return res.status(400).json({
+          success: false,
+          message: pinCheck.message
+        });
+      }
+
+      const user = await User.findById(
+        req.user.userId
+      );
+
+      if (!user) {
+        return res.status(404).json({
+          success: false,
+          message: "Kont lan pa jwenn."
+        });
+      }
+
+      if (user.pinEnabled) {
+        return res.status(409).json({
+          success: false,
+          message:
+            "PIN deja aktive. Sèvi ak Change PIN."
+        });
+      }
+
+      const passwordOk =
+        await bcrypt.compare(
+          currentPassword,
+          user.password
+        );
+
+      if (!passwordOk) {
+        return res.status(401).json({
+          success: false,
+          message: "Modpas la pa kòrèk."
+        });
+      }
+
+      user.pinHash =
+        await bcrypt.hash(pin, 12);
+
+      user.pinEnabled = true;
+      user.pinUpdatedAt = new Date();
+      user.pinFailedAttempts = 0;
+      user.pinLockedUntil = null;
+      user.pinVersion =
+        Number(user.pinVersion || 0) + 1;
+
+      await user.save();
+
+      return res.json({
+        success: true,
+        message: "PIN aktive.",
+        pinToken: createPinToken(user)
+      });
+    } catch (error) {
+      console.error("PIN_SETUP_ERROR:", error);
+
+      return res.status(500).json({
+        success: false,
+        message: "Pa rive aktive PIN lan."
+      });
+    }
+  }
+);
+
+app.post(
+  "/pin/verify",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const pin = String(req.body.pin || "");
+
+      const user = await User.findById(
+        req.user.userId
+      );
+
+      if (!user || !user.pinEnabled) {
+        return res.status(400).json({
+          success: false,
+          message: "PIN poko aktive sou kont sa."
+        });
+      }
+
+      const now = new Date();
+
+      if (
+        user.pinLockedUntil &&
+        user.pinLockedUntil > now
+      ) {
+        return res.status(423).json({
+          success: false,
+          code: "PIN_LOCKED",
+          lockedUntil: user.pinLockedUntil,
+          message:
+            "PIN bloke tanporèman apre twòp tantativ."
+        });
+      }
+
+      const ok =
+        await bcrypt.compare(
+          pin,
+          user.pinHash || ""
+        );
+
+      if (!ok) {
+        user.pinFailedAttempts =
+          Number(user.pinFailedAttempts || 0) + 1;
+
+        if (
+          user.pinFailedAttempts >=
+          PIN_MAX_ATTEMPTS
+        ) {
+          user.pinLockedUntil =
+            new Date(
+              Date.now() +
+              PIN_LOCK_MINUTES * 60 * 1000
+            );
+
+          user.pinFailedAttempts = 0;
+        }
+
+        await user.save();
+
+        return res.status(401).json({
+          success: false,
+          code:
+            user.pinLockedUntil
+              ? "PIN_LOCKED"
+              : "PIN_INCORRECT",
+          lockedUntil:
+            user.pinLockedUntil || null,
+          message:
+            user.pinLockedUntil
+              ? "Twòp tantativ. PIN bloke pou 15 minit."
+              : "PIN pa kòrèk."
+        });
+      }
+
+      user.pinFailedAttempts = 0;
+      user.pinLockedUntil = null;
+
+      await user.save();
+
+      return res.json({
+        success: true,
+        message: "Kont debloke.",
+        pinToken: createPinToken(user)
+      });
+    } catch {
+      return res.status(500).json({
+        success: false,
+        message: "Pa rive verifye PIN lan."
+      });
+    }
+  }
+);
+
+app.post(
+  "/pin/change",
+  requireAuth,
+  requirePinUnlock,
+  async (req, res) => {
+    try {
+      const currentPassword = String(
+        req.body.currentPassword || ""
+      );
+
+      const newPin = String(
+        req.body.newPin || ""
+      );
+
+      const pinCheck =
+        validatePin(newPin);
+
+      if (!pinCheck.ok) {
+        return res.status(400).json({
+          success: false,
+          message: pinCheck.message
+        });
+      }
+
+      const user = await User.findById(
+        req.user.userId
+      );
+
+      const passwordOk =
+        await bcrypt.compare(
+          currentPassword,
+          user.password
+        );
+
+      if (!passwordOk) {
+        return res.status(401).json({
+          success: false,
+          message: "Modpas la pa kòrèk."
+        });
+      }
+
+      user.pinHash =
+        await bcrypt.hash(newPin, 12);
+
+      user.pinUpdatedAt = new Date();
+      user.pinFailedAttempts = 0;
+      user.pinLockedUntil = null;
+      user.pinVersion =
+        Number(user.pinVersion || 0) + 1;
+
+      await user.save();
+
+      return res.json({
+        success: true,
+        message: "PIN modifye.",
+        pinToken: createPinToken(user)
+      });
+    } catch {
+      return res.status(500).json({
+        success: false,
+        message: "Pa rive modifye PIN lan."
+      });
+    }
+  }
+);
+
+app.post(
+  "/pin/reset",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const currentPassword = String(
+        req.body.currentPassword || ""
+      );
+
+      const newPin = String(
+        req.body.newPin || ""
+      );
+
+      const pinCheck =
+        validatePin(newPin);
+
+      if (!pinCheck.ok) {
+        return res.status(400).json({
+          success: false,
+          message: pinCheck.message
+        });
+      }
+
+      const user = await User.findById(
+        req.user.userId
+      );
+
+      if (!user) {
+        return res.status(404).json({
+          success: false,
+          message: "Kont lan pa jwenn."
+        });
+      }
+
+      const passwordOk =
+        await bcrypt.compare(
+          currentPassword,
+          user.password
+        );
+
+      if (!passwordOk) {
+        return res.status(401).json({
+          success: false,
+          message: "Modpas la pa kòrèk."
+        });
+      }
+
+      user.pinHash =
+        await bcrypt.hash(newPin, 12);
+
+      user.pinEnabled = true;
+      user.pinUpdatedAt = new Date();
+      user.pinFailedAttempts = 0;
+      user.pinLockedUntil = null;
+      user.pinVersion =
+        Number(user.pinVersion || 0) + 1;
+
+      await user.save();
+
+      return res.json({
+        success: true,
+        message: "PIN reset.",
+        pinToken: createPinToken(user)
+      });
+    } catch {
+      return res.status(500).json({
+        success: false,
+        message: "Pa rive reset PIN lan."
+      });
+    }
+  }
+);
+
+/* =========================
+   PASSWORD SECURITY
+========================= */
+
+app.post(
+  "/password/change",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const currentPassword = String(
+        req.body.currentPassword || ""
+      );
+
+      const newPassword = String(
+        req.body.newPassword || ""
+      );
+
+      const passwordCheck =
+        validateNewPassword(newPassword);
+
+      if (!passwordCheck.ok) {
+        return res.status(400).json({
+          success: false,
+          message: passwordCheck.message
+        });
+      }
+
+      const user = await User.findById(
+        req.user.userId
+      );
+
+      const ok =
+        await bcrypt.compare(
+          currentPassword,
+          user.password
+        );
+
+      if (!ok) {
+        return res.status(401).json({
+          success: false,
+          message: "Modpas aktyèl la pa kòrèk."
+        });
+      }
+
+      const same =
+        await bcrypt.compare(
+          newPassword,
+          user.password
+        );
+
+      if (same) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Nouvo modpas la dwe diferan."
+        });
+      }
+
+      user.password =
+        await bcrypt.hash(
+          newPassword,
+          12
+        );
+
+      user.authVersion =
+        Number(user.authVersion || 0) + 1;
+
+      user.pinVersion =
+        Number(user.pinVersion || 0) + 1;
+
+      await user.save();
+
+      const token = createToken(user);
+
+      return res.json({
+        success: true,
+        message:
+          "Modpas modifye. Lòt sessions yo revoke.",
+        token,
+        user: safeUser(user)
+      });
+    } catch {
+      return res.status(500).json({
+        success: false,
+        message: "Pa rive modifye modpas la."
+      });
+    }
+  }
+);
+
+app.post(
+  "/password/forgot",
+  async (req, res) => {
+    const genericMessage =
+      "Si email sa egziste, n ap voye enstriksyon reset la.";
+
+    try {
+      const email = normalizeEmail(
+        req.body.email
+      );
+
+      const user =
+        await User.findOne({ email });
+
+      if (!user) {
+        return res.json({
+          success: true,
+          message: genericMessage
+        });
+      }
+
+      if (
+        user.passwordResetRequestedAt &&
+        Date.now() -
+          new Date(
+            user.passwordResetRequestedAt
+          ).getTime() <
+          60 * 1000
+      ) {
+        return res.json({
+          success: true,
+          message: genericMessage
+        });
+      }
+
+      const rawToken =
+        crypto.randomBytes(32)
+          .toString("hex");
+
+      const hash =
+        crypto.createHash("sha256")
+          .update(rawToken)
+          .digest("hex");
+
+      user.passwordResetTokenHash = hash;
+      user.passwordResetExpiresAt =
+        new Date(
+          Date.now() +
+          PASSWORD_RESET_MINUTES *
+            60 * 1000
+        );
+
+      user.passwordResetRequestedAt =
+        new Date();
+
+      await user.save();
+
+      try {
+        await sendPasswordResetEmail(
+          user,
+          rawToken
+        );
+      } catch (error) {
+        console.error(
+          "PASSWORD_RESET_EMAIL_ERROR:",
+          error.message
+        );
+
+        if (
+          error.message ===
+          "PASSWORD_EMAIL_NOT_CONFIGURED"
+        ) {
+          return res.status(503).json({
+            success: false,
+            message:
+              "Email reset la poko configure sou server la."
+          });
+        }
+
+        return res.status(502).json({
+          success: false,
+          message:
+            "Pa rive voye email reset la."
+        });
+      }
+
+      return res.json({
+        success: true,
+        message: genericMessage
+      });
+    } catch {
+      return res.json({
+        success: true,
+        message: genericMessage
+      });
+    }
+  }
+);
+
+app.post(
+  "/password/reset",
+  async (req, res) => {
+    try {
+      const token = String(
+        req.body.token || ""
+      ).trim();
+
+      const newPassword = String(
+        req.body.newPassword || ""
+      );
+
+      const passwordCheck =
+        validateNewPassword(newPassword);
+
+      if (!passwordCheck.ok) {
+        return res.status(400).json({
+          success: false,
+          message: passwordCheck.message
+        });
+      }
+
+      const hash =
+        crypto.createHash("sha256")
+          .update(token)
+          .digest("hex");
+
+      const user =
+        await User.findOne({
+          passwordResetTokenHash: hash,
+          passwordResetExpiresAt: {
+            $gt: new Date()
+          }
+        });
+
+      if (!user) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Lyen reset la pa valab oswa li ekspire."
+        });
+      }
+
+      user.password =
+        await bcrypt.hash(
+          newPassword,
+          12
+        );
+
+      user.passwordResetTokenHash = null;
+      user.passwordResetExpiresAt = null;
+      user.passwordResetRequestedAt = null;
+
+      user.authVersion =
+        Number(user.authVersion || 0) + 1;
+
+      user.pinVersion =
+        Number(user.pinVersion || 0) + 1;
+
+      await user.save();
+
+      return res.json({
+        success: true,
+        message:
+          "Modpas reset. Ou ka konekte ankò."
+      });
+    } catch {
+      return res.status(500).json({
+        success: false,
+        message: "Pa rive reset modpas la."
+      });
+    }
+  }
+);
 
 /* =========================
    404 HANDLER
