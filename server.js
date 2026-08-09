@@ -249,6 +249,77 @@ const reserveSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
+
+const serviceOrderSchema = new mongoose.Schema(
+  {
+    userId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      required: true
+    },
+    service: {
+      type: String,
+      enum: ["Netflix", "Prime Video"],
+      required: true
+    },
+    plan: {
+      type: String,
+      required: true,
+      trim: true
+    },
+    amount: {
+      type: Number,
+      required: true,
+      min: 0.01
+    },
+    paymentMethod: {
+      type: String,
+      enum: ["wallet", "MonCash", "NatCash"],
+      required: true
+    },
+    paymentReference: {
+      type: String,
+      default: "",
+      trim: true
+    },
+    status: {
+      type: String,
+      enum: ["pending", "processing", "completed", "rejected"],
+      default: "pending"
+    },
+    walletCharged: {
+      type: Boolean,
+      default: false
+    },
+    customerEmail: {
+      type: String,
+      required: true,
+      lowercase: true,
+      trim: true
+    },
+    deliveryMessage: {
+      type: String,
+      default: "",
+      trim: true
+    },
+    adminNote: {
+      type: String,
+      default: "",
+      trim: true
+    },
+    reviewedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      default: null
+    },
+    reviewedAt: {
+      type: Date,
+      default: null
+    }
+  },
+  { timestamps: true }
+);
+
 /* =========================
    MODELS
 ========================= */
@@ -265,6 +336,11 @@ const DepositRequest = mongoose.model(
 const Reserve = mongoose.model(
   "Reserve",
   reserveSchema
+);
+
+const ServiceOrder = mongoose.model(
+  "ServiceOrder",
+  serviceOrderSchema
 );
 
 /* =========================
@@ -2249,6 +2325,54 @@ app.get(
   }
 );
 
+
+/* =========================
+   RELOADLY GIFTCARD PRODUCT DETAILS
+========================= */
+
+app.get(
+  "/reloadly/giftcards/:productId",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const productId = Number(req.params.productId);
+
+      if (!Number.isInteger(productId) || productId <= 0) {
+        return res.status(400).json({
+          success: false,
+          message: "Product ID pa valab."
+        });
+      }
+
+      const product = await reloadlyRequest(
+        "giftcards",
+        `/products/${productId}`
+      );
+
+      return res.json({
+        success: true,
+        product
+      });
+    } catch (error) {
+      console.error(
+        "RELOADLY_GIFTCARD_PRODUCT_ERROR:",
+        error.reloadly || error
+      );
+
+      return res.status(
+        error.statusCode && error.statusCode < 600
+          ? error.statusCode
+          : 500
+      ).json({
+        success: false,
+        message:
+          error.message ||
+          "Pa rive chaje detay pwodwi a."
+      });
+    }
+  }
+);
+
 /* =========================
    RELOADLY GIFTCARD ORDER
 ========================= */
@@ -2271,6 +2395,12 @@ app.post(
       const recipientEmail = normalizeEmail(
         req.body.recipientEmail || req.user.email
       );
+
+      const additionalRequirements =
+        req.body.additionalRequirements &&
+        typeof req.body.additionalRequirements === "object"
+          ? req.body.additionalRequirements
+          : null;
 
       if (
         !Number.isInteger(productId) ||
@@ -2317,7 +2447,10 @@ app.post(
             unitPrice,
             customIdentifier,
             senderName: chargedUser.name || "DLM Wallet",
-            recipientEmail
+            recipientEmail,
+            ...(additionalRequirements
+              ? { productAdditionalRequirements: additionalRequirements }
+              : {})
           })
         }
       );
@@ -2543,6 +2676,270 @@ app.post(
         message:
           error.message ||
           "Topup la echwe. Balans kliyan an pa pèdi."
+      });
+    }
+  }
+);
+
+
+/* =========================
+   MANUAL DIGITAL SERVICE ORDERS
+   Netflix / Prime Video
+========================= */
+
+app.post(
+  "/service-orders",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const service = String(req.body.service || "").trim();
+      const plan = String(req.body.plan || "").trim();
+      const amount = Number(req.body.amount);
+      const paymentMethod = String(req.body.paymentMethod || "").trim();
+      const paymentReference = String(req.body.paymentReference || "").trim();
+
+      if (!["Netflix", "Prime Video"].includes(service)) {
+        return res.status(400).json({
+          success: false,
+          message: "Sèvis la pa valab."
+        });
+      }
+
+      if (!plan || !Number.isFinite(amount) || amount <= 0) {
+        return res.status(400).json({
+          success: false,
+          message: "Plan ak montan an obligatwa."
+        });
+      }
+
+      if (!["wallet", "MonCash", "NatCash"].includes(paymentMethod)) {
+        return res.status(400).json({
+          success: false,
+          message: "Metòd peman an pa valab."
+        });
+      }
+
+      if (
+        ["MonCash", "NatCash"].includes(paymentMethod) &&
+        !paymentReference
+      ) {
+        return res.status(400).json({
+          success: false,
+          message: "Reference peman an obligatwa."
+        });
+      }
+
+      const user = await User.findById(req.user.userId);
+
+      if (!user || user.status !== "Active") {
+        return res.status(403).json({
+          success: false,
+          message: "Kont lan pa aktif."
+        });
+      }
+
+      let walletCharged = false;
+
+      if (paymentMethod === "wallet") {
+        const charged = await deductCustomerBalance(user._id, amount);
+
+        if (!charged) {
+          return res.status(400).json({
+            success: false,
+            message: "Balans pa sifi oswa kont lan pa aktif."
+          });
+        }
+
+        walletCharged = true;
+      }
+
+      try {
+        const order = await ServiceOrder.create({
+          userId: user._id,
+          service,
+          plan,
+          amount,
+          paymentMethod,
+          paymentReference,
+          walletCharged,
+          customerEmail: user.email,
+          status: "pending"
+        });
+
+        if (walletCharged) {
+          await Transaction.create({
+            userId: user._id,
+            type: "admin_debit",
+            amount,
+            status: "completed",
+            description: `${service} manual service order ${order._id}`
+          });
+
+          await reduceCustomerLiability(amount);
+        }
+
+        return res.status(201).json({
+          success: true,
+          message:
+            paymentMethod === "wallet"
+              ? "Kòmand lan resevwa. Li ap tann tretman admin."
+              : "Kòmand lan resevwa. Admin ap verifye peman an anvan tretman.",
+          order
+        });
+      } catch (error) {
+        if (walletCharged) {
+          await refundCustomerBalance(user._id, amount).catch(() => null);
+        }
+        throw error;
+      }
+    } catch (error) {
+      console.error("SERVICE_ORDER_CREATE_ERROR:", error);
+      return res.status(500).json({
+        success: false,
+        message: error.message || "Pa rive kreye kòmand lan."
+      });
+    }
+  }
+);
+
+app.get(
+  "/service-orders/mine",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const orders = await ServiceOrder.find({
+        userId: req.user.userId
+      }).sort({ createdAt: -1 });
+
+      return res.json({
+        success: true,
+        orders
+      });
+    } catch (error) {
+      return res.status(500).json({
+        success: false,
+        message: "Pa rive chaje kòmand yo."
+      });
+    }
+  }
+);
+
+app.get(
+  "/admin/service-orders",
+  requireAuth,
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const status = String(req.query.status || "").trim();
+      const filter = {};
+
+      if (
+        ["pending", "processing", "completed", "rejected"].includes(status)
+      ) {
+        filter.status = status;
+      }
+
+      const orders = await ServiceOrder.find(filter)
+        .populate("userId", "name email phone balance")
+        .populate("reviewedBy", "name email")
+        .sort({ createdAt: -1 });
+
+      return res.json({
+        success: true,
+        orders
+      });
+    } catch (error) {
+      return res.status(500).json({
+        success: false,
+        message: "Pa rive chaje kòmand sèvis yo."
+      });
+    }
+  }
+);
+
+app.patch(
+  "/admin/service-orders/:id",
+  requireAuth,
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const action = String(req.body.action || "").trim();
+      const deliveryMessage = String(
+        req.body.deliveryMessage || ""
+      ).trim();
+      const adminNote = String(req.body.adminNote || "").trim();
+
+      if (!["processing", "complete", "reject"].includes(action)) {
+        return res.status(400).json({
+          success: false,
+          message: "Aksyon admin lan pa valab."
+        });
+      }
+
+      const order = await ServiceOrder.findById(req.params.id);
+
+      if (!order) {
+        return res.status(404).json({
+          success: false,
+          message: "Kòmand lan pa jwenn."
+        });
+      }
+
+      if (["completed", "rejected"].includes(order.status)) {
+        return res.status(409).json({
+          success: false,
+          message: "Kòmand sa deja fini."
+        });
+      }
+
+      if (action === "processing") {
+        order.status = "processing";
+      }
+
+      if (action === "complete") {
+        if (!deliveryMessage) {
+          return res.status(400).json({
+            success: false,
+            message: "Mete mesaj/detay livrezon an anvan ou complete."
+          });
+        }
+
+        order.status = "completed";
+        order.deliveryMessage = deliveryMessage;
+      }
+
+      if (action === "reject") {
+        order.status = "rejected";
+
+        if (order.walletCharged) {
+          await refundCustomerBalance(order.userId, order.amount);
+
+          const reserve = await getOrCreateReserve();
+          reserve.customerLiability =
+            Number(reserve.customerLiability || 0) +
+            Number(order.amount || 0);
+          await reserve.save();
+
+          order.walletCharged = false;
+        }
+      }
+
+      order.adminNote = adminNote;
+      order.reviewedBy = req.user.userId;
+      order.reviewedAt = new Date();
+
+      await order.save();
+
+      return res.json({
+        success: true,
+        message: "Kòmand sèvis la modifye.",
+        order
+      });
+    } catch (error) {
+      console.error("ADMIN_SERVICE_ORDER_ERROR:", error);
+      return res.status(500).json({
+        success: false,
+        message: error.message || "Pa rive modifye kòmand lan."
       });
     }
   }
