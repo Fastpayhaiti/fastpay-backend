@@ -37,7 +37,14 @@ app.use(
   })
 );
 
-app.use(express.json({ limit: "6mb" }));
+app.use(
+  express.json({
+    limit: "6mb",
+    verify: (req, _res, buf) => {
+      req.rawBody = Buffer.from(buf);
+    }
+  })
+);
 
 if (!process.env.MONGO_URI) {
   throw new Error(
@@ -762,6 +769,583 @@ function reserveView(reserve) {
       customerLiability
   };
 }
+
+
+/* =========================
+   MONCASHCONNECT
+========================= */
+
+const MCC_API_BASE = String(
+  process.env.MCC_API_BASE || "https://api.moncashconnect.com/v1"
+).replace(/\/$/, "");
+
+const MCC_SECRET_KEY = String(
+  process.env.MCC_SECRET_KEY || ""
+).trim();
+
+const MCC_WEBHOOK_SECRET = String(
+  process.env.MCC_WEBHOOK_SECRET || ""
+).trim();
+
+const MCC_HTG_PER_USD = Number(
+  process.env.MCC_HTG_PER_USD || 0
+);
+
+const monCashPaymentSchema = new mongoose.Schema(
+  {
+    userId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      required: true
+    },
+    reference: {
+      type: String,
+      required: true,
+      unique: true,
+      index: true
+    },
+    requestedUsd: {
+      type: Number,
+      required: true,
+      min: 0.01
+    },
+    amountHtg: {
+      type: Number,
+      required: true,
+      min: 1
+    },
+    netAmountHtg: {
+      type: Number,
+      default: 0,
+      min: 0
+    },
+    creditedUsd: {
+      type: Number,
+      default: 0,
+      min: 0
+    },
+    fxRate: {
+      type: Number,
+      required: true,
+      min: 0.01
+    },
+    status: {
+      type: String,
+      enum: ["pending", "completed", "failed"],
+      default: "pending"
+    },
+    providerStatus: {
+      type: String,
+      default: ""
+    },
+    completedAt: {
+      type: Date,
+      default: null
+    }
+  },
+  { timestamps: true }
+);
+
+const MonCashPayment = mongoose.model(
+  "MonCashPayment",
+  monCashPaymentSchema
+);
+
+function monCashConfigured() {
+  return Boolean(
+    MCC_SECRET_KEY &&
+    MCC_WEBHOOK_SECRET &&
+    Number.isFinite(MCC_HTG_PER_USD) &&
+    MCC_HTG_PER_USD > 0
+  );
+}
+
+async function mccRequest(path, options = {}) {
+  const response = await fetch(
+    `${MCC_API_BASE}${path}`,
+    {
+      ...options,
+      headers: {
+        Authorization: `Bearer ${MCC_SECRET_KEY}`,
+        "Content-Type": "application/json",
+        ...(options.headers || {})
+      }
+    }
+  );
+
+  const text = await response.text();
+  let data = {};
+
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch {
+    data = {
+      error: text || "MonCashConnect response invalid."
+    };
+  }
+
+  if (!response.ok) {
+    const error = new Error(
+      data.error ||
+      data.message ||
+      `MonCashConnect error ${response.status}`
+    );
+
+    error.statusCode = response.status;
+    error.providerData = data;
+    throw error;
+  }
+
+  return data;
+}
+
+function verifyMccWebhook(req) {
+  if (!MCC_WEBHOOK_SECRET) {
+    return false;
+  }
+
+  const signature = String(
+    req.headers["x-mcc-signature"] || ""
+  ).trim();
+
+  const timestamp = String(
+    req.headers["x-mcc-timestamp"] || ""
+  ).trim();
+
+  if (!signature || !timestamp || !req.rawBody) {
+    return false;
+  }
+
+  const timestampNumber = Number(timestamp);
+
+  if (!Number.isFinite(timestampNumber)) {
+    return false;
+  }
+
+  const age = Math.abs(
+    Math.floor(Date.now() / 1000) - timestampNumber
+  );
+
+  // Anti-replay: max 5 minutes
+  if (age > 300) {
+    return false;
+  }
+
+  const expected =
+    "sha256=" +
+    crypto
+      .createHmac("sha256", MCC_WEBHOOK_SECRET)
+      .update(req.rawBody)
+      .digest("hex");
+
+  const receivedBuffer = Buffer.from(signature);
+  const expectedBuffer = Buffer.from(expected);
+
+  if (receivedBuffer.length !== expectedBuffer.length) {
+    return false;
+  }
+
+  return crypto.timingSafeEqual(
+    receivedBuffer,
+    expectedBuffer
+  );
+}
+
+/* =========================
+   CREATE MONCASH DEPOSIT
+========================= */
+
+app.post(
+  "/payments/moncash/create",
+  requireAuth,
+  async (req, res) => {
+    try {
+      if (!monCashConfigured()) {
+        return res.status(503).json({
+          success: false,
+          message:
+            "MonCashConnect poko configure sou server la."
+        });
+      }
+
+      const requestedUsd = Number(req.body.amountUsd);
+
+      if (
+        !Number.isFinite(requestedUsd) ||
+        requestedUsd <= 0
+      ) {
+        return res.status(400).json({
+          success: false,
+          message: "Montan USD a pa valab."
+        });
+      }
+
+      const user = await User.findById(
+        req.user.userId
+      );
+
+      if (!user || user.status !== "Active") {
+        return res.status(403).json({
+          success: false,
+          message: "Kont kliyan an pa aktif."
+        });
+      }
+
+      const amountHtg = Math.round(
+        requestedUsd * MCC_HTG_PER_USD
+      );
+
+      if (amountHtg < 1) {
+        return res.status(400).json({
+          success: false,
+          message: "Montan HTG a pa valab."
+        });
+      }
+
+      const reference =
+        `dlm_${user._id}_${Date.now()}`;
+
+      const payment = await mccRequest(
+        "/pay-create",
+        {
+          method: "POST",
+          headers: {
+            "Idempotency-Key": reference
+          },
+          body: JSON.stringify({
+            amount: amountHtg,
+            referenceId: reference,
+            returnUrl:
+              "https://dlmwallet.com/dashboard.html",
+            customerName: user.name,
+            customerEmail: user.email
+          })
+        }
+      );
+
+      await MonCashPayment.create({
+        userId: user._id,
+        reference,
+        requestedUsd,
+        amountHtg,
+        fxRate: MCC_HTG_PER_USD,
+        status: "pending"
+      });
+
+      return res.status(201).json({
+        success: true,
+        message: "Peman MonCash la pare.",
+        reference,
+        requestedUsd,
+        amountHtg,
+        paymentUrl: payment.paymentUrl,
+        expiresAt: payment.expiresAt || null
+      });
+    } catch (error) {
+      console.error(
+        "MCC_CREATE_PAYMENT_ERROR:",
+        error.providerData || error
+      );
+
+      return res.status(
+        error.statusCode &&
+        error.statusCode < 600
+          ? error.statusCode
+          : 500
+      ).json({
+        success: false,
+        message:
+          error.message ||
+          "Pa rive kreye peman MonCash la."
+      });
+    }
+  }
+);
+
+/* =========================
+   MONCASH WEBHOOK
+========================= */
+
+app.post(
+  "/webhooks/moncashconnect",
+  async (req, res) => {
+    try {
+      if (!verifyMccWebhook(req)) {
+        console.warn(
+          "MCC_WEBHOOK_INVALID_SIGNATURE"
+        );
+
+        return res.status(401).json({
+          success: false,
+          message: "Webhook signature invalid."
+        });
+      }
+
+      const event = req.body || {};
+
+      const eventName = String(
+        event.event || ""
+      ).trim();
+
+      const reference = String(
+        event.reference || event.referenceId || ""
+      ).trim();
+
+      if (!reference) {
+        return res.status(400).json({
+          success: false,
+          message: "Webhook reference manke."
+        });
+      }
+
+      if (eventName === "payment.failed") {
+        await MonCashPayment.findOneAndUpdate(
+          {
+            reference,
+            status: "pending"
+          },
+          {
+            $set: {
+              status: "failed",
+              providerStatus: "failed"
+            }
+          }
+        );
+
+        return res.sendStatus(200);
+      }
+
+      if (eventName !== "payment.completed") {
+        return res.sendStatus(200);
+      }
+
+      const payment = await MonCashPayment.findOne({
+        reference
+      });
+
+      if (!payment) {
+        console.warn(
+          "MCC_UNKNOWN_REFERENCE:",
+          reference
+        );
+        return res.sendStatus(200);
+      }
+
+      if (payment.status === "completed") {
+        return res.sendStatus(200);
+      }
+
+      if (
+        event.amount !== undefined &&
+        Number(event.amount) !==
+          Number(payment.amountHtg)
+      ) {
+        console.error(
+          "MCC_AMOUNT_MISMATCH:",
+          {
+            reference,
+            expected: payment.amountHtg,
+            received: event.amount
+          }
+        );
+
+        return res.status(409).json({
+          success: false,
+          message: "Webhook amount mismatch."
+        });
+      }
+
+      const providerStatus = await mccRequest(
+        `/pay-status?referenceId=${encodeURIComponent(reference)}`,
+        { method: "GET" }
+      );
+
+      if (
+        String(providerStatus.status || "").toLowerCase() !==
+        "completed"
+      ) {
+        return res.status(409).json({
+          success: false,
+          message:
+            "Provider poko konfime payment completed."
+        });
+      }
+
+      const netAmountHtg = Number(
+        providerStatus.netAmount ??
+        providerStatus.amount
+      );
+
+      if (
+        !Number.isFinite(netAmountHtg) ||
+        netAmountHtg <= 0
+      ) {
+        return res.status(409).json({
+          success: false,
+          message:
+            "Net amount provider la pa valab."
+        });
+      }
+
+      const creditedUsd = Number(
+        (
+          netAmountHtg /
+          Number(payment.fxRate)
+        ).toFixed(2)
+      );
+
+      if (creditedUsd <= 0) {
+        return res.status(409).json({
+          success: false,
+          message: "USD credit la pa valab."
+        });
+      }
+
+      const session =
+        await mongoose.startSession();
+
+      try {
+        await session.withTransaction(
+          async () => {
+            const claimed =
+              await MonCashPayment.findOneAndUpdate(
+                {
+                  _id: payment._id,
+                  status: "pending"
+                },
+                {
+                  $set: {
+                    status: "completed",
+                    providerStatus: "completed",
+                    netAmountHtg,
+                    creditedUsd,
+                    completedAt: new Date()
+                  }
+                },
+                {
+                  new: true,
+                  session
+                }
+              );
+
+            if (!claimed) {
+              return;
+            }
+
+            const user =
+              await User.findOneAndUpdate(
+                {
+                  _id: payment.userId,
+                  status: "Active"
+                },
+                {
+                  $inc: {
+                    balance: creditedUsd
+                  }
+                },
+                {
+                  new: true,
+                  session
+                }
+              );
+
+            if (!user) {
+              throw new Error(
+                "Kliyan payment lan pa jwenn oswa kont lan pa aktif."
+              );
+            }
+
+            await Transaction.create(
+              [
+                {
+                  userId: user._id,
+                  type: "deposit",
+                  amount: creditedUsd,
+                  status: "completed",
+                  description:
+                    `MonCashConnect deposit ${reference}`
+                }
+              ],
+              { session }
+            );
+
+            const reserve =
+              await getOrCreateReserve(session);
+
+            reserve.cashReserve =
+              Number(reserve.cashReserve || 0) +
+              creditedUsd;
+
+            reserve.customerLiability =
+              Number(reserve.customerLiability || 0) +
+              creditedUsd;
+
+            await reserve.save({ session });
+          }
+        );
+      } finally {
+        session.endSession();
+      }
+
+      return res.sendStatus(200);
+    } catch (error) {
+      console.error(
+        "MCC_WEBHOOK_ERROR:",
+        error
+      );
+
+      return res.status(500).json({
+        success: false,
+        message: "Webhook processing failed."
+      });
+    }
+  }
+);
+
+/* =========================
+   MONCASH PAYMENT STATUS
+========================= */
+
+app.get(
+  "/payments/moncash/:reference",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const payment =
+        await MonCashPayment.findOne({
+          reference: req.params.reference,
+          userId: req.user.userId
+        });
+
+      if (!payment) {
+        return res.status(404).json({
+          success: false,
+          message: "Peman an pa jwenn."
+        });
+      }
+
+      return res.json({
+        success: true,
+        payment: {
+          reference: payment.reference,
+          requestedUsd: payment.requestedUsd,
+          amountHtg: payment.amountHtg,
+          netAmountHtg: payment.netAmountHtg,
+          creditedUsd: payment.creditedUsd,
+          status: payment.status,
+          createdAt: payment.createdAt,
+          completedAt: payment.completedAt
+        }
+      });
+    } catch (error) {
+      return res.status(500).json({
+        success: false,
+        message: "Pa rive chaje payment lan."
+      });
+    }
+  }
+);
+
 
 /* =========================
    PUBLIC
