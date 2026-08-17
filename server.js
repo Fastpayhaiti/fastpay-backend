@@ -1348,6 +1348,691 @@ app.get(
 
 
 /* =========================
+   PAYPAL CHECKOUT / CARD DEPOSITS
+========================= */
+
+const PAYPAL_MODE = String(
+  process.env.PAYPAL_MODE || "sandbox"
+).trim().toLowerCase();
+
+const PAYPAL_CLIENT_ID = String(
+  process.env.PAYPAL_CLIENT_ID || ""
+).trim();
+
+const PAYPAL_CLIENT_SECRET = String(
+  process.env.PAYPAL_CLIENT_SECRET || ""
+).trim();
+
+const PAYPAL_API_BASE =
+  PAYPAL_MODE === "live" || PAYPAL_MODE === "production"
+    ? "https://api-m.paypal.com"
+    : "https://api-m.sandbox.paypal.com";
+
+const paypalPaymentSchema = new mongoose.Schema(
+  {
+    userId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      required: true
+    },
+    orderId: {
+      type: String,
+      required: true,
+      unique: true,
+      index: true,
+      trim: true
+    },
+    reference: {
+      type: String,
+      required: true,
+      unique: true,
+      index: true,
+      trim: true
+    },
+    requestedUsd: {
+      type: Number,
+      required: true,
+      min: 0.01
+    },
+    creditedUsd: {
+      type: Number,
+      default: 0,
+      min: 0
+    },
+    netReserveUsd: {
+      type: Number,
+      default: 0,
+      min: 0
+    },
+    paypalFeeUsd: {
+      type: Number,
+      default: 0,
+      min: 0
+    },
+    captureId: {
+      type: String,
+      default: "",
+      trim: true
+    },
+    payerEmail: {
+      type: String,
+      default: "",
+      trim: true,
+      lowercase: true
+    },
+    status: {
+      type: String,
+      enum: ["pending", "completed", "failed"],
+      default: "pending"
+    },
+    providerStatus: {
+      type: String,
+      default: ""
+    },
+    completedAt: {
+      type: Date,
+      default: null
+    }
+  },
+  { timestamps: true }
+);
+
+const PayPalPayment = mongoose.model(
+  "PayPalPayment",
+  paypalPaymentSchema
+);
+
+function paypalConfigured() {
+  return Boolean(
+    PAYPAL_CLIENT_ID &&
+    PAYPAL_CLIENT_SECRET
+  );
+}
+
+async function getPayPalAccessToken() {
+  if (!paypalConfigured()) {
+    const error = new Error(
+      "PayPal poko configure sou server la."
+    );
+    error.statusCode = 503;
+    throw error;
+  }
+
+  const credentials = Buffer.from(
+    `${PAYPAL_CLIENT_ID}:${PAYPAL_CLIENT_SECRET}`
+  ).toString("base64");
+
+  const response = await fetch(
+    `${PAYPAL_API_BASE}/v1/oauth2/token`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Basic ${credentials}`,
+        "Content-Type":
+          "application/x-www-form-urlencoded",
+        Accept: "application/json"
+      },
+      body: "grant_type=client_credentials"
+    }
+  );
+
+  const text = await response.text();
+  let data = {};
+
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch {
+    data = {
+      error_description:
+        text || "PayPal token response invalid."
+    };
+  }
+
+  if (!response.ok || !data.access_token) {
+    const error = new Error(
+      data.error_description ||
+      data.message ||
+      `PayPal OAuth error ${response.status}`
+    );
+
+    error.statusCode = response.status;
+    error.providerData = data;
+    throw error;
+  }
+
+  return data.access_token;
+}
+
+async function paypalRequest(path, options = {}) {
+  const accessToken = await getPayPalAccessToken();
+
+  const response = await fetch(
+    `${PAYPAL_API_BASE}${path}`,
+    {
+      ...options,
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        Accept: "application/json",
+        ...(options.body
+          ? { "Content-Type": "application/json" }
+          : {}),
+        ...(options.headers || {})
+      }
+    }
+  );
+
+  const text = await response.text();
+  let data = {};
+
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch {
+    data = {
+      message:
+        text || "PayPal response invalid."
+    };
+  }
+
+  if (!response.ok) {
+    const error = new Error(
+      data.message ||
+      data.error_description ||
+      data.name ||
+      `PayPal error ${response.status}`
+    );
+
+    error.statusCode = response.status;
+    error.providerData = data;
+    throw error;
+  }
+
+  return data;
+}
+
+function getPayPalCapture(order) {
+  return (
+    order?.purchase_units?.[0]
+      ?.payments?.captures?.[0] || null
+  );
+}
+
+function getPayPalAmountValue(money) {
+  const value = Number(money?.value);
+  return Number.isFinite(value) ? value : 0;
+}
+
+function getPayPalCurrency(money) {
+  return String(
+    money?.currency_code || ""
+  ).trim().toUpperCase();
+}
+
+async function loadCapturedPayPalOrder(orderId) {
+  return paypalRequest(
+    `/v2/checkout/orders/${encodeURIComponent(orderId)}`,
+    { method: "GET" }
+  );
+}
+
+app.get(
+  "/payments/paypal/config",
+  requireAuth,
+  async (_req, res) => {
+    if (!paypalConfigured()) {
+      return res.status(503).json({
+        success: false,
+        message:
+          "PayPal poko configure sou server la."
+      });
+    }
+
+    return res.json({
+      success: true,
+      clientId: PAYPAL_CLIENT_ID,
+      currency: "USD",
+      mode:
+        PAYPAL_MODE === "live" ||
+        PAYPAL_MODE === "production"
+          ? "live"
+          : "sandbox"
+    });
+  }
+);
+
+app.post(
+  "/payments/paypal/create",
+  requireAuth,
+  async (req, res) => {
+    try {
+      if (!paypalConfigured()) {
+        return res.status(503).json({
+          success: false,
+          message:
+            "PayPal poko configure sou server la."
+        });
+      }
+
+      const requestedUsd = Number(
+        req.body.amountUsd
+      );
+
+      if (
+        !Number.isFinite(requestedUsd) ||
+        requestedUsd <= 0
+      ) {
+        return res.status(400).json({
+          success: false,
+          message: "Montan USD a pa valab."
+        });
+      }
+
+      const amountUsd = Number(
+        requestedUsd.toFixed(2)
+      );
+
+      const user = await User.findById(
+        req.user.userId
+      );
+
+      if (!user || user.status !== "Active") {
+        return res.status(403).json({
+          success: false,
+          message: "Kont kliyan an pa aktif."
+        });
+      }
+
+      const reference =
+        `dlm_pp_${user._id}_${Date.now()}`;
+
+      const requestId =
+        `create-${user._id}-${Date.now()}`;
+
+      const order = await paypalRequest(
+        "/v2/checkout/orders",
+        {
+          method: "POST",
+          headers: {
+            "PayPal-Request-Id": requestId,
+            Prefer: "return=representation"
+          },
+          body: JSON.stringify({
+            intent: "CAPTURE",
+            purchase_units: [
+              {
+                reference_id: reference,
+                custom_id: reference,
+                description:
+                  "DLM Wallet balance deposit",
+                amount: {
+                  currency_code: "USD",
+                  value: amountUsd.toFixed(2)
+                }
+              }
+            ],
+            application_context: {
+              shipping_preference: "NO_SHIPPING",
+              user_action: "PAY_NOW",
+              brand_name: "DLMWALLET"
+            }
+          })
+        }
+      );
+
+      if (!order?.id) {
+        throw new Error(
+          "PayPal pa retounen Order ID."
+        );
+      }
+
+      await PayPalPayment.create({
+        userId: user._id,
+        orderId: order.id,
+        reference,
+        requestedUsd: amountUsd,
+        status: "pending",
+        providerStatus: String(
+          order.status || "CREATED"
+        )
+      });
+
+      return res.status(201).json({
+        success: true,
+        message: "PayPal order la kreye.",
+        orderId: order.id,
+        reference,
+        requestedUsd: amountUsd,
+        status: order.status || "CREATED"
+      });
+    } catch (error) {
+      console.error(
+        "PAYPAL_CREATE_ORDER_ERROR:",
+        error.providerData || error
+      );
+
+      return res.status(
+        error.statusCode && error.statusCode < 600
+          ? error.statusCode
+          : 500
+      ).json({
+        success: false,
+        message:
+          error.message ||
+          "Pa rive kreye PayPal order la."
+      });
+    }
+  }
+);
+
+app.post(
+  "/payments/paypal/:orderId/capture",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const orderId = String(
+        req.params.orderId || ""
+      ).trim();
+
+      if (!orderId) {
+        return res.status(400).json({
+          success: false,
+          message: "PayPal Order ID obligatwa."
+        });
+      }
+
+      const payment = await PayPalPayment.findOne({
+        orderId,
+        userId: req.user.userId
+      });
+
+      if (!payment) {
+        return res.status(404).json({
+          success: false,
+          message:
+            "PayPal order sa pa jwenn pou kont ou."
+        });
+      }
+
+      if (payment.status === "completed") {
+        const currentUser = await User.findById(
+          req.user.userId
+        ).select("balance");
+
+        return res.json({
+          success: true,
+          alreadyCompleted: true,
+          message: "Peman sa te deja kredite.",
+          orderId: payment.orderId,
+          captureId: payment.captureId,
+          creditedUsd: payment.creditedUsd,
+          balance: Number(currentUser?.balance || 0)
+        });
+      }
+
+      let order = null;
+
+      try {
+        order = await paypalRequest(
+          `/v2/checkout/orders/${encodeURIComponent(orderId)}/capture`,
+          {
+            method: "POST",
+            headers: {
+              "PayPal-Request-Id": `capture-${orderId}`,
+              Prefer: "return=representation"
+            },
+            body: JSON.stringify({})
+          }
+        );
+      } catch (captureError) {
+        const issues = Array.isArray(
+          captureError?.providerData?.details
+        )
+          ? captureError.providerData.details.map(
+              (item) => String(item?.issue || "")
+            )
+          : [];
+
+        if (issues.includes("ORDER_ALREADY_CAPTURED")) {
+          order = await loadCapturedPayPalOrder(orderId);
+        } else {
+          throw captureError;
+        }
+      }
+
+      const capture = getPayPalCapture(order);
+
+      if (
+        String(order?.status || "").toUpperCase() !== "COMPLETED" ||
+        String(capture?.status || "").toUpperCase() !== "COMPLETED"
+      ) {
+        return res.status(409).json({
+          success: false,
+          message:
+            "PayPal poko konfime peman an kòm COMPLETED."
+        });
+      }
+
+      const grossUsd = getPayPalAmountValue(capture.amount);
+      const grossCurrency = getPayPalCurrency(capture.amount);
+
+      if (
+        grossCurrency !== "USD" ||
+        Number(grossUsd.toFixed(2)) !==
+          Number(payment.requestedUsd.toFixed(2))
+      ) {
+        console.error("PAYPAL_AMOUNT_MISMATCH:", {
+          orderId,
+          expected: payment.requestedUsd,
+          received: grossUsd,
+          currency: grossCurrency
+        });
+
+        return res.status(409).json({
+          success: false,
+          message:
+            "Montan PayPal la pa koresponn ak order DLMWALLET la."
+        });
+      }
+
+      const receivable =
+        capture?.seller_receivable_breakdown || {};
+
+      const netMoney = receivable?.net_amount;
+      const feeMoney = receivable?.paypal_fee;
+
+      const netReserveUsd =
+        getPayPalCurrency(netMoney) === "USD"
+          ? getPayPalAmountValue(netMoney)
+          : grossUsd;
+
+      const paypalFeeUsd =
+        getPayPalCurrency(feeMoney) === "USD"
+          ? getPayPalAmountValue(feeMoney)
+          : Math.max(
+              0,
+              Number((grossUsd - netReserveUsd).toFixed(2))
+            );
+
+      const creditedUsd = Number(grossUsd.toFixed(2));
+
+      const session = await mongoose.startSession();
+      let finalBalance = null;
+
+      try {
+        await session.withTransaction(async () => {
+          const claimed = await PayPalPayment.findOneAndUpdate(
+            {
+              _id: payment._id,
+              status: "pending"
+            },
+            {
+              $set: {
+                status: "completed",
+                providerStatus: "COMPLETED",
+                captureId: String(capture.id || ""),
+                creditedUsd,
+                netReserveUsd: Number(netReserveUsd.toFixed(2)),
+                paypalFeeUsd: Number(paypalFeeUsd.toFixed(2)),
+                payerEmail: normalizeEmail(
+                  order?.payer?.email_address ||
+                  order?.payment_source?.paypal?.email_address ||
+                  ""
+                ),
+                completedAt: new Date()
+              }
+            },
+            {
+              new: true,
+              session
+            }
+          );
+
+          if (!claimed) {
+            const existing = await PayPalPayment.findById(
+              payment._id
+            ).session(session);
+
+            if (existing?.status === "completed") {
+              const existingUser = await User.findById(
+                payment.userId
+              ).select("balance").session(session);
+
+              finalBalance = Number(existingUser?.balance || 0);
+              return;
+            }
+
+            throw new Error(
+              "PayPal payment lan pa kapab reklame pou kredi."
+            );
+          }
+
+          const user = await User.findOneAndUpdate(
+            {
+              _id: payment.userId,
+              status: "Active"
+            },
+            {
+              $inc: { balance: creditedUsd }
+            },
+            {
+              new: true,
+              session
+            }
+          );
+
+          if (!user) {
+            throw new Error(
+              "Kliyan PayPal payment lan pa jwenn oswa kont lan pa aktif."
+            );
+          }
+
+          finalBalance = Number(user.balance || 0);
+
+          await Transaction.create(
+            [
+              {
+                userId: user._id,
+                type: "deposit",
+                amount: creditedUsd,
+                status: "completed",
+                description: `PayPal/Card deposit ${orderId}`
+              }
+            ],
+            { session }
+          );
+
+          const reserve = await getOrCreateReserve(session);
+
+          reserve.cashReserve =
+            Number(reserve.cashReserve || 0) +
+            Number(netReserveUsd || 0);
+
+          reserve.customerLiability =
+            Number(reserve.customerLiability || 0) +
+            creditedUsd;
+
+          await reserve.save({ session });
+        });
+      } finally {
+        session.endSession();
+      }
+
+      return res.json({
+        success: true,
+        message:
+          "Peman PayPal/kat la konfime epi balans DLMWALLET la kredite.",
+        orderId,
+        captureId: String(capture.id || ""),
+        creditedUsd,
+        paypalFeeUsd: Number(paypalFeeUsd.toFixed(2)),
+        netReserveUsd: Number(netReserveUsd.toFixed(2)),
+        balance: finalBalance
+      });
+    } catch (error) {
+      console.error(
+        "PAYPAL_CAPTURE_ERROR:",
+        error.providerData || error
+      );
+
+      return res.status(
+        error.statusCode && error.statusCode < 600
+          ? error.statusCode
+          : 500
+      ).json({
+        success: false,
+        message:
+          error.message ||
+          "Pa rive capture PayPal payment lan."
+      });
+    }
+  }
+);
+
+app.get(
+  "/payments/paypal/:orderId",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const payment = await PayPalPayment.findOne({
+        orderId: String(req.params.orderId || "").trim(),
+        userId: req.user.userId
+      });
+
+      if (!payment) {
+        return res.status(404).json({
+          success: false,
+          message: "PayPal payment lan pa jwenn."
+        });
+      }
+
+      return res.json({
+        success: true,
+        payment: {
+          orderId: payment.orderId,
+          reference: payment.reference,
+          requestedUsd: payment.requestedUsd,
+          creditedUsd: payment.creditedUsd,
+          netReserveUsd: payment.netReserveUsd,
+          paypalFeeUsd: payment.paypalFeeUsd,
+          captureId: payment.captureId,
+          status: payment.status,
+          providerStatus: payment.providerStatus,
+          createdAt: payment.createdAt,
+          completedAt: payment.completedAt
+        }
+      });
+    } catch (error) {
+      console.error("PAYPAL_PAYMENT_STATUS_ERROR:", error);
+
+      return res.status(500).json({
+        success: false,
+        message: "Pa rive chaje PayPal payment lan."
+      });
+    }
+  }
+);
+
+
+/* =========================
    PUBLIC
 ========================= */
 
