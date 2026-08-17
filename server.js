@@ -1347,6 +1347,7 @@ app.get(
 );
 
 
+
 /* =========================
    PAYPAL CHECKOUT / CARD DEPOSITS
 ========================= */
@@ -1361,6 +1362,10 @@ const PAYPAL_CLIENT_ID = String(
 
 const PAYPAL_CLIENT_SECRET = String(
   process.env.PAYPAL_CLIENT_SECRET || ""
+).trim();
+
+const PAYPAL_WEBHOOK_ID = String(
+  process.env.PAYPAL_WEBHOOK_ID || ""
 ).trim();
 
 const PAYPAL_API_BASE =
@@ -1468,8 +1473,7 @@ async function getPayPalAccessToken() {
       method: "POST",
       headers: {
         Authorization: `Basic ${credentials}`,
-        "Content-Type":
-          "application/x-www-form-urlencoded",
+        "Content-Type": "application/x-www-form-urlencoded",
         Accept: "application/json"
       },
       body: "grant_type=client_credentials"
@@ -1494,7 +1498,6 @@ async function getPayPalAccessToken() {
       data.message ||
       `PayPal OAuth error ${response.status}`
     );
-
     error.statusCode = response.status;
     error.providerData = data;
     throw error;
@@ -1540,7 +1543,6 @@ async function paypalRequest(path, options = {}) {
       data.name ||
       `PayPal error ${response.status}`
     );
-
     error.statusCode = response.status;
     error.providerData = data;
     throw error;
@@ -1574,6 +1576,290 @@ async function loadCapturedPayPalOrder(orderId) {
   );
 }
 
+async function verifyPayPalWebhookSignature(req) {
+  if (!PAYPAL_WEBHOOK_ID) {
+    const error = new Error(
+      "PAYPAL_WEBHOOK_ID manke nan Render Environment."
+    );
+    error.statusCode = 503;
+    throw error;
+  }
+
+  const transmissionId = String(
+    req.headers["paypal-transmission-id"] || ""
+  ).trim();
+
+  const transmissionTime = String(
+    req.headers["paypal-transmission-time"] || ""
+  ).trim();
+
+  const transmissionSig = String(
+    req.headers["paypal-transmission-sig"] || ""
+  ).trim();
+
+  const certUrl = String(
+    req.headers["paypal-cert-url"] || ""
+  ).trim();
+
+  const authAlgo = String(
+    req.headers["paypal-auth-algo"] || ""
+  ).trim();
+
+  if (
+    !transmissionId ||
+    !transmissionTime ||
+    !transmissionSig ||
+    !certUrl ||
+    !authAlgo
+  ) {
+    return false;
+  }
+
+  const result = await paypalRequest(
+    "/v1/notifications/verify-webhook-signature",
+    {
+      method: "POST",
+      body: JSON.stringify({
+        auth_algo: authAlgo,
+        cert_url: certUrl,
+        transmission_id: transmissionId,
+        transmission_sig: transmissionSig,
+        transmission_time: transmissionTime,
+        webhook_id: PAYPAL_WEBHOOK_ID,
+        webhook_event: req.body
+      })
+    }
+  );
+
+  return String(
+    result?.verification_status || ""
+  ).toUpperCase() === "SUCCESS";
+}
+
+async function finalizePayPalPayment(
+  payment,
+  order,
+  sourceLabel = "capture"
+) {
+  if (!payment) {
+    throw new Error(
+      "PayPal payment record pa jwenn."
+    );
+  }
+
+  if (payment.status === "completed") {
+    const user = await User.findById(
+      payment.userId
+    ).select("balance");
+
+    return {
+      alreadyCompleted: true,
+      creditedUsd:
+        Number(payment.creditedUsd || 0),
+      balance:
+        Number(user?.balance || 0)
+    };
+  }
+
+  const capture = getPayPalCapture(order);
+
+  if (
+    String(order?.status || "").toUpperCase() !== "COMPLETED" ||
+    String(capture?.status || "").toUpperCase() !== "COMPLETED"
+  ) {
+    const error = new Error(
+      "PayPal poko konfime peman an kòm COMPLETED."
+    );
+    error.statusCode = 409;
+    throw error;
+  }
+
+  const grossUsd =
+    getPayPalAmountValue(capture.amount);
+
+  const grossCurrency =
+    getPayPalCurrency(capture.amount);
+
+  if (
+    grossCurrency !== "USD" ||
+    Number(grossUsd.toFixed(2)) !==
+      Number(payment.requestedUsd.toFixed(2))
+  ) {
+    const error = new Error(
+      "Montan PayPal la pa koresponn ak order DLMWALLET la."
+    );
+    error.statusCode = 409;
+    throw error;
+  }
+
+  const receivable =
+    capture?.seller_receivable_breakdown || {};
+
+  const netMoney = receivable?.net_amount;
+  const feeMoney = receivable?.paypal_fee;
+
+  const netReserveUsd =
+    getPayPalCurrency(netMoney) === "USD"
+      ? getPayPalAmountValue(netMoney)
+      : grossUsd;
+
+  const paypalFeeUsd =
+    getPayPalCurrency(feeMoney) === "USD"
+      ? getPayPalAmountValue(feeMoney)
+      : Math.max(
+          0,
+          Number(
+            (grossUsd - netReserveUsd).toFixed(2)
+          )
+        );
+
+  const creditedUsd =
+    Number(grossUsd.toFixed(2));
+
+  const session =
+    await mongoose.startSession();
+
+  let finalBalance = null;
+  let didCredit = false;
+
+  try {
+    await session.withTransaction(
+      async () => {
+        const claimed =
+          await PayPalPayment.findOneAndUpdate(
+            {
+              _id: payment._id,
+              status: "pending"
+            },
+            {
+              $set: {
+                status: "completed",
+                providerStatus: "COMPLETED",
+                captureId:
+                  String(capture.id || ""),
+                creditedUsd,
+                netReserveUsd:
+                  Number(netReserveUsd.toFixed(2)),
+                paypalFeeUsd:
+                  Number(paypalFeeUsd.toFixed(2)),
+                payerEmail:
+                  normalizeEmail(
+                    order?.payer?.email_address ||
+                    order?.payment_source
+                      ?.paypal?.email_address ||
+                    ""
+                  ),
+                completedAt: new Date()
+              }
+            },
+            {
+              new: true,
+              session
+            }
+          );
+
+        if (!claimed) {
+          const existing =
+            await PayPalPayment.findById(
+              payment._id
+            ).session(session);
+
+          if (
+            existing?.status === "completed"
+          ) {
+            const existingUser =
+              await User.findById(
+                payment.userId
+              )
+                .select("balance")
+                .session(session);
+
+            finalBalance =
+              Number(existingUser?.balance || 0);
+
+            return;
+          }
+
+          throw new Error(
+            "PayPal payment lan pa kapab reklame pou kredi."
+          );
+        }
+
+        const user =
+          await User.findOneAndUpdate(
+            {
+              _id: payment.userId,
+              status: "Active"
+            },
+            {
+              $inc: {
+                balance: creditedUsd
+              }
+            },
+            {
+              new: true,
+              session
+            }
+          );
+
+        if (!user) {
+          throw new Error(
+            "Kliyan PayPal payment lan pa jwenn oswa kont lan pa aktif."
+          );
+        }
+
+        finalBalance =
+          Number(user.balance || 0);
+
+        didCredit = true;
+
+        await Transaction.create(
+          [
+            {
+              userId: user._id,
+              type: "deposit",
+              amount: creditedUsd,
+              status: "completed",
+              description:
+                `PayPal/Card deposit ${payment.orderId} via ${sourceLabel}`
+            }
+          ],
+          { session }
+        );
+
+        const reserve =
+          await getOrCreateReserve(session);
+
+        reserve.cashReserve =
+          Number(reserve.cashReserve || 0) +
+          Number(netReserveUsd || 0);
+
+        reserve.customerLiability =
+          Number(reserve.customerLiability || 0) +
+          creditedUsd;
+
+        await reserve.save({ session });
+      }
+    );
+  } finally {
+    session.endSession();
+  }
+
+  return {
+    alreadyCompleted: !didCredit,
+    creditedUsd,
+    paypalFeeUsd:
+      Number(paypalFeeUsd.toFixed(2)),
+    netReserveUsd:
+      Number(netReserveUsd.toFixed(2)),
+    balance: finalBalance
+  };
+}
+
+/* =========================
+   PAYPAL PUBLIC CLIENT CONFIG
+========================= */
+
 app.get(
   "/payments/paypal/config",
   requireAuth,
@@ -1599,6 +1885,10 @@ app.get(
   }
 );
 
+/* =========================
+   CREATE PAYPAL ORDER
+========================= */
+
 app.post(
   "/payments/paypal/create",
   requireAuth,
@@ -1612,9 +1902,8 @@ app.post(
         });
       }
 
-      const requestedUsd = Number(
-        req.body.amountUsd
-      );
+      const requestedUsd =
+        Number(req.body.amountUsd);
 
       if (
         !Number.isFinite(requestedUsd) ||
@@ -1622,61 +1911,67 @@ app.post(
       ) {
         return res.status(400).json({
           success: false,
-          message: "Montan USD a pa valab."
+          message:
+            "Montan USD a pa valab."
         });
       }
 
-      const amountUsd = Number(
-        requestedUsd.toFixed(2)
-      );
+      const amountUsd =
+        Number(requestedUsd.toFixed(2));
 
-      const user = await User.findById(
-        req.user.userId
-      );
+      const user =
+        await User.findById(
+          req.user.userId
+        );
 
-      if (!user || user.status !== "Active") {
+      if (
+        !user ||
+        user.status !== "Active"
+      ) {
         return res.status(403).json({
           success: false,
-          message: "Kont kliyan an pa aktif."
+          message:
+            "Kont kliyan an pa aktif."
         });
       }
 
       const reference =
         `dlm_pp_${user._id}_${Date.now()}`;
 
-      const requestId =
-        `create-${user._id}-${Date.now()}`;
-
-      const order = await paypalRequest(
-        "/v2/checkout/orders",
-        {
-          method: "POST",
-          headers: {
-            "PayPal-Request-Id": requestId,
-            Prefer: "return=representation"
-          },
-          body: JSON.stringify({
-            intent: "CAPTURE",
-            purchase_units: [
-              {
-                reference_id: reference,
-                custom_id: reference,
-                description:
-                  "DLM Wallet balance deposit",
-                amount: {
-                  currency_code: "USD",
-                  value: amountUsd.toFixed(2)
+      const order =
+        await paypalRequest(
+          "/v2/checkout/orders",
+          {
+            method: "POST",
+            headers: {
+              "PayPal-Request-Id":
+                `create-${reference}`,
+              Prefer: "return=representation"
+            },
+            body: JSON.stringify({
+              intent: "CAPTURE",
+              purchase_units: [
+                {
+                  reference_id: reference,
+                  custom_id: reference,
+                  description:
+                    "DLM Wallet balance deposit",
+                  amount: {
+                    currency_code: "USD",
+                    value:
+                      amountUsd.toFixed(2)
+                  }
                 }
+              ],
+              application_context: {
+                shipping_preference:
+                  "NO_SHIPPING",
+                user_action: "PAY_NOW",
+                brand_name: "DLMWALLET"
               }
-            ],
-            application_context: {
-              shipping_preference: "NO_SHIPPING",
-              user_action: "PAY_NOW",
-              brand_name: "DLMWALLET"
-            }
-          })
-        }
-      );
+            })
+          }
+        );
 
       if (!order?.id) {
         throw new Error(
@@ -1690,18 +1985,19 @@ app.post(
         reference,
         requestedUsd: amountUsd,
         status: "pending",
-        providerStatus: String(
-          order.status || "CREATED"
-        )
+        providerStatus:
+          String(order.status || "CREATED")
       });
 
       return res.status(201).json({
         success: true,
-        message: "PayPal order la kreye.",
+        message:
+          "PayPal order la kreye.",
         orderId: order.id,
         reference,
         requestedUsd: amountUsd,
-        status: order.status || "CREATED"
+        status:
+          order.status || "CREATED"
       });
     } catch (error) {
       console.error(
@@ -1710,7 +2006,8 @@ app.post(
       );
 
       return res.status(
-        error.statusCode && error.statusCode < 600
+        error.statusCode &&
+        error.statusCode < 600
           ? error.statusCode
           : 500
       ).json({
@@ -1723,26 +2020,31 @@ app.post(
   }
 );
 
+/* =========================
+   CAPTURE PAYPAL ORDER
+========================= */
+
 app.post(
   "/payments/paypal/:orderId/capture",
   requireAuth,
   async (req, res) => {
     try {
-      const orderId = String(
-        req.params.orderId || ""
-      ).trim();
+      const orderId =
+        String(req.params.orderId || "").trim();
 
       if (!orderId) {
         return res.status(400).json({
           success: false,
-          message: "PayPal Order ID obligatwa."
+          message:
+            "PayPal Order ID obligatwa."
         });
       }
 
-      const payment = await PayPalPayment.findOne({
-        orderId,
-        userId: req.user.userId
-      });
+      const payment =
+        await PayPalPayment.findOne({
+          orderId,
+          userId: req.user.userId
+        });
 
       if (!payment) {
         return res.status(404).json({
@@ -1753,219 +2055,81 @@ app.post(
       }
 
       if (payment.status === "completed") {
-        const currentUser = await User.findById(
-          req.user.userId
-        ).select("balance");
+        const currentUser =
+          await User.findById(
+            req.user.userId
+          ).select("balance");
 
         return res.json({
           success: true,
           alreadyCompleted: true,
-          message: "Peman sa te deja kredite.",
+          message:
+            "Peman sa te deja kredite.",
           orderId: payment.orderId,
           captureId: payment.captureId,
           creditedUsd: payment.creditedUsd,
-          balance: Number(currentUser?.balance || 0)
+          balance:
+            Number(currentUser?.balance || 0)
         });
       }
 
       let order = null;
 
       try {
-        order = await paypalRequest(
-          `/v2/checkout/orders/${encodeURIComponent(orderId)}/capture`,
-          {
-            method: "POST",
-            headers: {
-              "PayPal-Request-Id": `capture-${orderId}`,
-              Prefer: "return=representation"
-            },
-            body: JSON.stringify({})
-          }
-        );
+        order =
+          await paypalRequest(
+            `/v2/checkout/orders/${encodeURIComponent(orderId)}/capture`,
+            {
+              method: "POST",
+              headers: {
+                "PayPal-Request-Id":
+                  `capture-${orderId}`,
+                Prefer: "return=representation"
+              },
+              body: JSON.stringify({})
+            }
+          );
       } catch (captureError) {
-        const issues = Array.isArray(
-          captureError?.providerData?.details
-        )
-          ? captureError.providerData.details.map(
-              (item) => String(item?.issue || "")
-            )
-          : [];
+        const issues =
+          Array.isArray(
+            captureError?.providerData?.details
+          )
+            ? captureError.providerData.details
+                .map(
+                  item =>
+                    String(item?.issue || "")
+                )
+            : [];
 
-        if (issues.includes("ORDER_ALREADY_CAPTURED")) {
-          order = await loadCapturedPayPalOrder(orderId);
+        if (
+          issues.includes(
+            "ORDER_ALREADY_CAPTURED"
+          )
+        ) {
+          order =
+            await loadCapturedPayPalOrder(
+              orderId
+            );
         } else {
           throw captureError;
         }
       }
 
-      const capture = getPayPalCapture(order);
-
-      if (
-        String(order?.status || "").toUpperCase() !== "COMPLETED" ||
-        String(capture?.status || "").toUpperCase() !== "COMPLETED"
-      ) {
-        return res.status(409).json({
-          success: false,
-          message:
-            "PayPal poko konfime peman an kòm COMPLETED."
-        });
-      }
-
-      const grossUsd = getPayPalAmountValue(capture.amount);
-      const grossCurrency = getPayPalCurrency(capture.amount);
-
-      if (
-        grossCurrency !== "USD" ||
-        Number(grossUsd.toFixed(2)) !==
-          Number(payment.requestedUsd.toFixed(2))
-      ) {
-        console.error("PAYPAL_AMOUNT_MISMATCH:", {
-          orderId,
-          expected: payment.requestedUsd,
-          received: grossUsd,
-          currency: grossCurrency
-        });
-
-        return res.status(409).json({
-          success: false,
-          message:
-            "Montan PayPal la pa koresponn ak order DLMWALLET la."
-        });
-      }
-
-      const receivable =
-        capture?.seller_receivable_breakdown || {};
-
-      const netMoney = receivable?.net_amount;
-      const feeMoney = receivable?.paypal_fee;
-
-      const netReserveUsd =
-        getPayPalCurrency(netMoney) === "USD"
-          ? getPayPalAmountValue(netMoney)
-          : grossUsd;
-
-      const paypalFeeUsd =
-        getPayPalCurrency(feeMoney) === "USD"
-          ? getPayPalAmountValue(feeMoney)
-          : Math.max(
-              0,
-              Number((grossUsd - netReserveUsd).toFixed(2))
-            );
-
-      const creditedUsd = Number(grossUsd.toFixed(2));
-
-      const session = await mongoose.startSession();
-      let finalBalance = null;
-
-      try {
-        await session.withTransaction(async () => {
-          const claimed = await PayPalPayment.findOneAndUpdate(
-            {
-              _id: payment._id,
-              status: "pending"
-            },
-            {
-              $set: {
-                status: "completed",
-                providerStatus: "COMPLETED",
-                captureId: String(capture.id || ""),
-                creditedUsd,
-                netReserveUsd: Number(netReserveUsd.toFixed(2)),
-                paypalFeeUsd: Number(paypalFeeUsd.toFixed(2)),
-                payerEmail: normalizeEmail(
-                  order?.payer?.email_address ||
-                  order?.payment_source?.paypal?.email_address ||
-                  ""
-                ),
-                completedAt: new Date()
-              }
-            },
-            {
-              new: true,
-              session
-            }
-          );
-
-          if (!claimed) {
-            const existing = await PayPalPayment.findById(
-              payment._id
-            ).session(session);
-
-            if (existing?.status === "completed") {
-              const existingUser = await User.findById(
-                payment.userId
-              ).select("balance").session(session);
-
-              finalBalance = Number(existingUser?.balance || 0);
-              return;
-            }
-
-            throw new Error(
-              "PayPal payment lan pa kapab reklame pou kredi."
-            );
-          }
-
-          const user = await User.findOneAndUpdate(
-            {
-              _id: payment.userId,
-              status: "Active"
-            },
-            {
-              $inc: { balance: creditedUsd }
-            },
-            {
-              new: true,
-              session
-            }
-          );
-
-          if (!user) {
-            throw new Error(
-              "Kliyan PayPal payment lan pa jwenn oswa kont lan pa aktif."
-            );
-          }
-
-          finalBalance = Number(user.balance || 0);
-
-          await Transaction.create(
-            [
-              {
-                userId: user._id,
-                type: "deposit",
-                amount: creditedUsd,
-                status: "completed",
-                description: `PayPal/Card deposit ${orderId}`
-              }
-            ],
-            { session }
-          );
-
-          const reserve = await getOrCreateReserve(session);
-
-          reserve.cashReserve =
-            Number(reserve.cashReserve || 0) +
-            Number(netReserveUsd || 0);
-
-          reserve.customerLiability =
-            Number(reserve.customerLiability || 0) +
-            creditedUsd;
-
-          await reserve.save({ session });
-        });
-      } finally {
-        session.endSession();
-      }
+      const result =
+        await finalizePayPalPayment(
+          payment,
+          order,
+          "frontend-capture"
+        );
 
       return res.json({
         success: true,
         message:
-          "Peman PayPal/kat la konfime epi balans DLMWALLET la kredite.",
+          result.alreadyCompleted
+            ? "Peman sa te deja kredite."
+            : "Peman PayPal/kat la konfime epi balans DLMWALLET la kredite.",
         orderId,
-        captureId: String(capture.id || ""),
-        creditedUsd,
-        paypalFeeUsd: Number(paypalFeeUsd.toFixed(2)),
-        netReserveUsd: Number(netReserveUsd.toFixed(2)),
-        balance: finalBalance
+        ...result
       });
     } catch (error) {
       console.error(
@@ -1974,7 +2138,8 @@ app.post(
       );
 
       return res.status(
-        error.statusCode && error.statusCode < 600
+        error.statusCode &&
+        error.statusCode < 600
           ? error.statusCode
           : 500
       ).json({
@@ -1987,20 +2152,158 @@ app.post(
   }
 );
 
+/* =========================
+   PAYPAL WEBHOOK
+========================= */
+
+app.post(
+  "/webhooks/paypal",
+  async (req, res) => {
+    try {
+      const event = req.body || {};
+      const eventType =
+        String(event.event_type || "").trim();
+
+      if (
+        eventType !==
+        "PAYMENT.CAPTURE.COMPLETED"
+      ) {
+        return res.sendStatus(200);
+      }
+
+      const resource =
+        event.resource || {};
+
+      const orderId =
+        String(
+          resource?.supplementary_data
+            ?.related_ids?.order_id || ""
+        ).trim();
+
+      const captureId =
+        String(resource?.id || "").trim();
+
+      if (!orderId) {
+        console.warn(
+          "PAYPAL_WEBHOOK_NO_ORDER_ID",
+          event.id || ""
+        );
+        return res.sendStatus(200);
+      }
+
+      const payment =
+        await PayPalPayment.findOne({
+          orderId
+        });
+
+      /*
+        PayPal Webhook Simulator uses fake order IDs.
+        Unknown orders are acknowledged but NEVER credited.
+        This lets us test endpoint connectivity safely.
+      */
+      if (!payment) {
+        console.log(
+          "PAYPAL_WEBHOOK_UNKNOWN_ORDER:",
+          orderId,
+          captureId
+        );
+        return res.sendStatus(200);
+      }
+
+      if (
+        payment.status === "completed"
+      ) {
+        console.log(
+          "PAYPAL_WEBHOOK_ALREADY_COMPLETED:",
+          orderId
+        );
+        return res.sendStatus(200);
+      }
+
+      const verified =
+        await verifyPayPalWebhookSignature(
+          req
+        );
+
+      if (!verified) {
+        console.warn(
+          "PAYPAL_WEBHOOK_INVALID_SIGNATURE:",
+          orderId
+        );
+
+        return res.status(401).json({
+          success: false,
+          message:
+            "PayPal webhook signature invalid."
+        });
+      }
+
+      /*
+        Do not trust webhook amount alone.
+        Fetch the authoritative order from PayPal API,
+        then validate COMPLETED + exact USD amount.
+      */
+      const order =
+        await loadCapturedPayPalOrder(
+          orderId
+        );
+
+      await finalizePayPalPayment(
+        payment,
+        order,
+        "verified-webhook"
+      );
+
+      console.log(
+        "PAYPAL_WEBHOOK_CREDITED:",
+        orderId
+      );
+
+      return res.sendStatus(200);
+    } catch (error) {
+      console.error(
+        "PAYPAL_WEBHOOK_ERROR:",
+        error.providerData || error
+      );
+
+      return res.status(
+        error.statusCode &&
+        error.statusCode < 600
+          ? error.statusCode
+          : 500
+      ).json({
+        success: false,
+        message:
+          error.message ||
+          "PayPal webhook processing failed."
+      });
+    }
+  }
+);
+
+/* =========================
+   PAYPAL PAYMENT STATUS
+========================= */
+
 app.get(
   "/payments/paypal/:orderId",
   requireAuth,
   async (req, res) => {
     try {
-      const payment = await PayPalPayment.findOne({
-        orderId: String(req.params.orderId || "").trim(),
-        userId: req.user.userId
-      });
+      const payment =
+        await PayPalPayment.findOne({
+          orderId:
+            String(
+              req.params.orderId || ""
+            ).trim(),
+          userId: req.user.userId
+        });
 
       if (!payment) {
         return res.status(404).json({
           success: false,
-          message: "PayPal payment lan pa jwenn."
+          message:
+            "PayPal payment lan pa jwenn."
         });
       }
 
@@ -2009,23 +2312,36 @@ app.get(
         payment: {
           orderId: payment.orderId,
           reference: payment.reference,
-          requestedUsd: payment.requestedUsd,
-          creditedUsd: payment.creditedUsd,
-          netReserveUsd: payment.netReserveUsd,
-          paypalFeeUsd: payment.paypalFeeUsd,
-          captureId: payment.captureId,
-          status: payment.status,
-          providerStatus: payment.providerStatus,
-          createdAt: payment.createdAt,
-          completedAt: payment.completedAt
+          requestedUsd:
+            payment.requestedUsd,
+          creditedUsd:
+            payment.creditedUsd,
+          netReserveUsd:
+            payment.netReserveUsd,
+          paypalFeeUsd:
+            payment.paypalFeeUsd,
+          captureId:
+            payment.captureId,
+          status:
+            payment.status,
+          providerStatus:
+            payment.providerStatus,
+          createdAt:
+            payment.createdAt,
+          completedAt:
+            payment.completedAt
         }
       });
     } catch (error) {
-      console.error("PAYPAL_PAYMENT_STATUS_ERROR:", error);
+      console.error(
+        "PAYPAL_PAYMENT_STATUS_ERROR:",
+        error
+      );
 
       return res.status(500).json({
         success: false,
-        message: "Pa rive chaje PayPal payment lan."
+        message:
+          "Pa rive chaje PayPal payment lan."
       });
     }
   }
