@@ -4428,6 +4428,605 @@ app.patch(
 
 
 
+
+/* =========================
+   FINANCE CONTROL CENTER
+   Read-only accounting / reconciliation views
+========================= */
+
+async function aggregateAmount(Model, match, field = "amount") {
+  const result = await Model.aggregate([
+    { $match: match || {} },
+    {
+      $group: {
+        _id: null,
+        total: {
+          $sum: {
+            $ifNull: [`$${field}`, 0]
+          }
+        },
+        count: { $sum: 1 }
+      }
+    }
+  ]);
+
+  return {
+    total: Number(result?.[0]?.total || 0),
+    count: Number(result?.[0]?.count || 0)
+  };
+}
+
+async function sumUserBalances() {
+  const result = await User.aggregate([
+    {
+      $group: {
+        _id: null,
+        total: {
+          $sum: {
+            $ifNull: ["$balance", 0]
+          }
+        },
+        count: { $sum: 1 }
+      }
+    }
+  ]);
+
+  return {
+    total: Number(result?.[0]?.total || 0),
+    count: Number(result?.[0]?.count || 0)
+  };
+}
+
+app.get(
+  "/admin/finance/summary",
+  requireAuth,
+  requireAdmin,
+  async (_req, res) => {
+    try {
+      const [
+        userBalances,
+        pendingWithdrawals,
+        processingWithdrawals,
+        approvedWithdrawals,
+        rejectedWithdrawals,
+        paypalCompleted,
+        paypalFees,
+        paypalNet,
+        moncashCompleted,
+        moncashNetHtg,
+        manualApprovedDeposits,
+        manualPendingDeposits,
+        topupSpend,
+        giftcardSpend,
+        adminCredits,
+        adminDebits,
+        servicePending,
+        serviceProcessing,
+        serviceCompleted,
+        serviceRejected,
+        reserve
+      ] = await Promise.all([
+        sumUserBalances(),
+
+        aggregateAmount(
+          WithdrawalRequest,
+          { status: "pending" }
+        ),
+
+        aggregateAmount(
+          WithdrawalRequest,
+          { status: "processing" }
+        ),
+
+        aggregateAmount(
+          WithdrawalRequest,
+          { status: "approved" }
+        ),
+
+        aggregateAmount(
+          WithdrawalRequest,
+          { status: "rejected" }
+        ),
+
+        aggregateAmount(
+          PayPalPayment,
+          { status: "completed" },
+          "creditedUsd"
+        ),
+
+        aggregateAmount(
+          PayPalPayment,
+          { status: "completed" },
+          "paypalFeeUsd"
+        ),
+
+        aggregateAmount(
+          PayPalPayment,
+          { status: "completed" },
+          "netReserveUsd"
+        ),
+
+        aggregateAmount(
+          MonCashPayment,
+          { status: "completed" },
+          "creditedUsd"
+        ),
+
+        aggregateAmount(
+          MonCashPayment,
+          { status: "completed" },
+          "netAmountHtg"
+        ),
+
+        aggregateAmount(
+          DepositRequest,
+          { status: "approved" }
+        ),
+
+        aggregateAmount(
+          DepositRequest,
+          { status: "pending" }
+        ),
+
+        aggregateAmount(
+          Transaction,
+          {
+            type: "topup",
+            status: "completed"
+          }
+        ),
+
+        aggregateAmount(
+          Transaction,
+          {
+            type: "giftcard",
+            status: "completed"
+          }
+        ),
+
+        aggregateAmount(
+          Transaction,
+          {
+            type: "admin_credit",
+            status: "completed"
+          }
+        ),
+
+        aggregateAmount(
+          Transaction,
+          {
+            type: "admin_debit",
+            status: "completed"
+          }
+        ),
+
+        aggregateAmount(
+          ServiceOrder,
+          {
+            status: "pending",
+            walletCharged: true
+          }
+        ),
+
+        aggregateAmount(
+          ServiceOrder,
+          {
+            status: "processing",
+            walletCharged: true
+          }
+        ),
+
+        aggregateAmount(
+          ServiceOrder,
+          {
+            status: "completed",
+            walletCharged: true
+          }
+        ),
+
+        aggregateAmount(
+          ServiceOrder,
+          {
+            status: "rejected",
+            walletCharged: true
+          }
+        ),
+
+        getOrCreateReserve()
+      ]);
+
+      const reservedWithdrawals =
+        Number(pendingWithdrawals.total || 0) +
+        Number(processingWithdrawals.total || 0);
+
+      const serviceFundsInProgress =
+        Number(servicePending.total || 0) +
+        Number(serviceProcessing.total || 0);
+
+      /*
+        Customer obligation here means money still spendable
+        plus withdrawal requests whose funds are reserved.
+        Service orders already charged from wallet are shown
+        separately as committed service funds.
+      */
+      const customerObligationEstimate =
+        Number(userBalances.total || 0) +
+        reservedWithdrawals;
+
+      const reserveData = reserveView(reserve);
+
+      const liabilityDifference = Number(
+        (
+          Number(reserveData.customerLiability || 0) -
+          customerObligationEstimate
+        ).toFixed(2)
+      );
+
+      const knownProcessorCollections = Number(
+        (
+          Number(paypalNet.total || 0) +
+          Number(moncashCompleted.total || 0) +
+          Number(manualApprovedDeposits.total || 0)
+        ).toFixed(2)
+      );
+
+      return res.json({
+        success: true,
+        generatedAt: new Date().toISOString(),
+
+        customerFunds: {
+          spendableWalletBalances:
+            Number(userBalances.total.toFixed(2)),
+          customerCount: userBalances.count,
+
+          reservedWithdrawals:
+            Number(reservedWithdrawals.toFixed(2)),
+
+          pendingWithdrawalCount:
+            pendingWithdrawals.count,
+
+          processingWithdrawalCount:
+            processingWithdrawals.count,
+
+          customerObligationEstimate:
+            Number(
+              customerObligationEstimate.toFixed(2)
+            ),
+
+          committedServiceFunds:
+            Number(
+              serviceFundsInProgress.toFixed(2)
+            )
+        },
+
+        processorCollections: {
+          paypal: {
+            grossWalletCredits:
+              Number(paypalCompleted.total.toFixed(2)),
+            knownFees:
+              Number(paypalFees.total.toFixed(2)),
+            recordedNetCollections:
+              Number(paypalNet.total.toFixed(2)),
+            completedPayments:
+              paypalCompleted.count
+          },
+
+          moncash: {
+            walletCreditsUsd:
+              Number(moncashCompleted.total.toFixed(2)),
+            recordedNetAmountHtg:
+              Number(moncashNetHtg.total.toFixed(2)),
+            completedPayments:
+              moncashCompleted.count
+          },
+
+          manualDeposits: {
+            approvedUsd:
+              Number(
+                manualApprovedDeposits.total.toFixed(2)
+              ),
+            approvedCount:
+              manualApprovedDeposits.count,
+            pendingUsd:
+              Number(
+                manualPendingDeposits.total.toFixed(2)
+              ),
+            pendingCount:
+              manualPendingDeposits.count
+          },
+
+          recordedNetCollectionsUsd:
+            knownProcessorCollections
+        },
+
+        outflowsAndSpend: {
+          approvedWithdrawalsUsd:
+            Number(
+              approvedWithdrawals.total.toFixed(2)
+            ),
+          approvedWithdrawalCount:
+            approvedWithdrawals.count,
+
+          rejectedWithdrawalsUsd:
+            Number(
+              rejectedWithdrawals.total.toFixed(2)
+            ),
+
+          airtimeSpendUsd:
+            Number(topupSpend.total.toFixed(2)),
+
+          giftcardSpendUsd:
+            Number(giftcardSpend.total.toFixed(2)),
+
+          serviceOrders: {
+            pendingUsd:
+              Number(servicePending.total.toFixed(2)),
+            processingUsd:
+              Number(serviceProcessing.total.toFixed(2)),
+            completedUsd:
+              Number(serviceCompleted.total.toFixed(2)),
+            rejectedUsd:
+              Number(serviceRejected.total.toFixed(2))
+          }
+        },
+
+        adminAdjustments: {
+          creditsUsd:
+            Number(adminCredits.total.toFixed(2)),
+          debitsUsd:
+            Number(adminDebits.total.toFixed(2))
+        },
+
+        reserve: {
+          ...reserveData,
+          computedCustomerObligation:
+            Number(
+              customerObligationEstimate.toFixed(2)
+            ),
+          liabilityDifference
+        },
+
+        notes: [
+          "PayPal figures are derived from completed DLMWALLET PayPalPayment records, not a live PayPal account balance.",
+          "MonCash figures are derived from completed DLMWALLET MonCashPayment records, not a live MonCashConnect merchant balance.",
+          "Manual deposit figures are DLMWALLET records and must match the external bank/NatCash/MonCash evidence.",
+          "Provider costs and actual external provider wallet balances are not fully represented unless the provider API supplies and DLMWALLET stores those costs."
+        ]
+      });
+    } catch (error) {
+      console.error(
+        "ADMIN_FINANCE_SUMMARY_ERROR:",
+        error
+      );
+
+      return res.status(500).json({
+        success: false,
+        message:
+          "Pa rive chaje Finance Control Center la."
+      });
+    }
+  }
+);
+
+app.get(
+  "/admin/finance/audit",
+  requireAuth,
+  requireAdmin,
+  async (_req, res) => {
+    try {
+      const [
+        usersWithNegativeBalance,
+        pendingWithdrawals,
+        processingWithdrawals,
+        reserve,
+        userBalances,
+        paypalMissingCapture,
+        moncashMissingCompletion,
+        pendingTxWithdrawals
+      ] = await Promise.all([
+        User.find({
+          balance: { $lt: 0 }
+        })
+          .select("_id name email balance")
+          .limit(100),
+
+        WithdrawalRequest.find({
+          status: "pending"
+        })
+          .select(
+            "_id userId amount method account transactionId createdAt"
+          )
+          .limit(500),
+
+        WithdrawalRequest.find({
+          status: "processing"
+        })
+          .select(
+            "_id userId amount method account transactionId createdAt"
+          )
+          .limit(500),
+
+        getOrCreateReserve(),
+
+        sumUserBalances(),
+
+        PayPalPayment.find({
+          status: "completed",
+          $or: [
+            { captureId: "" },
+            { captureId: null }
+          ]
+        })
+          .select(
+            "_id userId orderId creditedUsd captureId completedAt"
+          )
+          .limit(100),
+
+        MonCashPayment.find({
+          status: "completed",
+          completedAt: null
+        })
+          .select(
+            "_id userId reference creditedUsd completedAt"
+          )
+          .limit(100),
+
+        Transaction.find({
+          type: "withdraw",
+          status: "pending"
+        })
+          .select(
+            "_id userId amount description createdAt"
+          )
+          .limit(500)
+      ]);
+
+      const reservedWithdrawals = [
+        ...pendingWithdrawals,
+        ...processingWithdrawals
+      ].reduce(
+        (sum, item) =>
+          sum + Number(item.amount || 0),
+        0
+      );
+
+      const computedObligation =
+        Number(userBalances.total || 0) +
+        reservedWithdrawals;
+
+      const reserveData = reserveView(reserve);
+
+      const liabilityDifference = Number(
+        (
+          Number(reserveData.customerLiability || 0) -
+          computedObligation
+        ).toFixed(2)
+      );
+
+      const findings = [];
+
+      if (usersWithNegativeBalance.length) {
+        findings.push({
+          severity: "critical",
+          code: "NEGATIVE_USER_BALANCE",
+          count: usersWithNegativeBalance.length,
+          message:
+            "Gen kliyan ki gen balans negatif."
+        });
+      }
+
+      if (Math.abs(liabilityDifference) >= 0.01) {
+        findings.push({
+          severity: "warning",
+          code: "LIABILITY_MISMATCH",
+          amountUsd: liabilityDifference,
+          message:
+            "Reserve.customerLiability pa matche ak balans kliyan + retrè rezève yo. Sa ka soti nan service orders, admin adjustments, oswa ansyen done."
+        });
+      }
+
+      if (paypalMissingCapture.length) {
+        findings.push({
+          severity: "warning",
+          code: "PAYPAL_COMPLETED_WITHOUT_CAPTURE_ID",
+          count: paypalMissingCapture.length,
+          message:
+            "Gen PayPal payment ki Completed san captureId."
+        });
+      }
+
+      if (moncashMissingCompletion.length) {
+        findings.push({
+          severity: "warning",
+          code: "MONCASH_COMPLETED_WITHOUT_COMPLETED_AT",
+          count: moncashMissingCompletion.length,
+          message:
+            "Gen MonCash payment ki Completed san completedAt."
+        });
+      }
+
+      const withdrawalTxIds = new Set(
+        pendingTxWithdrawals.map(
+          item => String(item._id)
+        )
+      );
+
+      const missingPendingTransaction =
+        [...pendingWithdrawals, ...processingWithdrawals]
+          .filter(
+            item =>
+              !item.transactionId ||
+              !withdrawalTxIds.has(
+                String(item.transactionId)
+              )
+          )
+          .map(item => ({
+            id: item._id,
+            userId: item.userId,
+            amount: item.amount,
+            status:
+              pendingWithdrawals.some(
+                p =>
+                  String(p._id) === String(item._id)
+              )
+                ? "pending"
+                : "processing"
+          }));
+
+      if (missingPendingTransaction.length) {
+        findings.push({
+          severity: "warning",
+          code: "WITHDRAWAL_TRANSACTION_LINK_MISSING",
+          count: missingPendingTransaction.length,
+          message:
+            "Gen retrè Pending/Processing ki pa gen Transaction pending ki lye ak yo."
+        });
+      }
+
+      return res.json({
+        success: true,
+        generatedAt: new Date().toISOString(),
+
+        totals: {
+          spendableWalletBalancesUsd:
+            Number(userBalances.total.toFixed(2)),
+          reservedWithdrawalsUsd:
+            Number(reservedWithdrawals.toFixed(2)),
+          computedCustomerObligationUsd:
+            Number(computedObligation.toFixed(2)),
+          reserveCustomerLiabilityUsd:
+            Number(
+              reserveData.customerLiability.toFixed(2)
+            ),
+          liabilityDifferenceUsd:
+            liabilityDifference
+        },
+
+        findings,
+
+        samples: {
+          usersWithNegativeBalance,
+          paypalMissingCapture,
+          moncashMissingCompletion,
+          missingPendingTransaction
+        }
+      });
+    } catch (error) {
+      console.error(
+        "ADMIN_FINANCE_AUDIT_ERROR:",
+        error
+      );
+
+      return res.status(500).json({
+        success: false,
+        message:
+          "Pa rive fè finance audit la."
+      });
+    }
+  }
+);
+
+
 /* =========================
    RELOADLY
 ========================= */
