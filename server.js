@@ -104,6 +104,11 @@ const userSchema = new mongoose.Schema(
       default: 0,
       min: 0
     },
+    cardBalance: {
+      type: Number,
+      default: 0,
+      min: 0
+    },
     role: {
       type: String,
       enum: ["customer", "admin"],
@@ -177,7 +182,9 @@ const transactionSchema = new mongoose.Schema(
         "admin_credit",
         "admin_debit",
         "topup",
-        "giftcard"
+        "giftcard",
+        "card_fund",
+        "card_unfund"
       ],
       required: true
     },
@@ -508,6 +515,7 @@ function publicUser(user) {
     phone: user.phone,
     email: user.email,
     balance: Number(user.balance || 0),
+    cardBalance: Number(user.cardBalance || 0),
     role: user.role,
     status: user.status,
     pinEnabled: Boolean(user.pinEnabled),
@@ -6054,7 +6062,7 @@ app.patch("/admin/kyc/:id", requireAuth, requireAdmin, async (req, res) => {
 app.get("/card/status", requireAuth, async (req, res) => {
   try {
     const [user, kyc, cardRequest] = await Promise.all([
-      User.findById(req.user.userId).select("balance"),
+      User.findById(req.user.userId).select("balance cardBalance"),
       KycProfile.findOne({ userId: req.user.userId }).select("status"),
       VirtualCardRequest.findOne({ userId: req.user.userId }).sort({ createdAt: -1 })
     ]);
@@ -6062,6 +6070,8 @@ app.get("/card/status", requireAuth, async (req, res) => {
     return res.json({
       success: true,
       balance: Number(user?.balance || 0),
+      walletBalance: Number(user?.balance || 0),
+      cardBalance: Number(user?.cardBalance || 0),
       minimumBalance: 10,
       kycStatus: kyc?.status || "not_submitted",
       cardRequest: cardRequest || null
@@ -6069,6 +6079,46 @@ app.get("/card/status", requireAuth, async (req, res) => {
   } catch {
     return res.status(500).json({ success: false, message: "Pa rive chaje status kat la." });
   }
+});
+
+
+/* =========================
+   CARD BALANCE - INTERNAL DLM LEDGER
+========================= */
+app.post("/card/fund", requireAuth, requirePinUnlock, async (req,res)=>{
+  const session=await mongoose.startSession();
+  try{
+    const amount=Number(req.body.amount);
+    if(!Number.isFinite(amount)||amount<=0) return res.status(400).json({success:false,message:"Montan an pa valab."});
+    const value=Number(amount.toFixed(2)); let result=null;
+    await session.withTransaction(async()=>{
+      const kyc=await KycProfile.findOne({userId:req.user.userId}).session(session);
+      if(!kyc||kyc.status!=="verified"){const e=new Error("KYC dwe verifye anvan ou mete lajan sou kat la.");e.statusCode=403;throw e}
+      const approved=await VirtualCardRequest.findOne({userId:req.user.userId,status:"approved"}).sort({createdAt:-1}).session(session);
+      if(!approved){const e=new Error("Kat la dwe apwouve anvan ou kapab mete lajan sou li.");e.statusCode=403;throw e}
+      result=await User.findOneAndUpdate({_id:req.user.userId,status:"Active",balance:{$gte:value}},{$inc:{balance:-value,cardBalance:value}},{new:true,session});
+      if(!result){const e=new Error("Balans DLM Wallet ou pa sifi.");e.statusCode=400;throw e}
+      await Transaction.create([{userId:result._id,type:"card_fund",amount:value,status:"completed",description:"DLM Wallet -> Card balance"}],{session});
+    });
+    return res.json({success:true,message:`$${value.toFixed(2)} USD mete sou Card balance ou.`,walletBalance:Number(result.balance||0),cardBalance:Number(result.cardBalance||0)});
+  }catch(e){console.error("CARD_FUND_ERROR:",e);return res.status(e.statusCode||500).json({success:false,message:e.message||"Pa rive mete lajan sou kat la."})}
+  finally{session.endSession()}
+});
+
+app.post("/card/unfund", requireAuth, requirePinUnlock, async (req,res)=>{
+  const session=await mongoose.startSession();
+  try{
+    const amount=Number(req.body.amount);
+    if(!Number.isFinite(amount)||amount<=0) return res.status(400).json({success:false,message:"Montan an pa valab."});
+    const value=Number(amount.toFixed(2)); let result=null;
+    await session.withTransaction(async()=>{
+      result=await User.findOneAndUpdate({_id:req.user.userId,status:"Active",cardBalance:{$gte:value}},{$inc:{cardBalance:-value,balance:value}},{new:true,session});
+      if(!result){const e=new Error("Card balance ou pa sifi.");e.statusCode=400;throw e}
+      await Transaction.create([{userId:result._id,type:"card_unfund",amount:value,status:"completed",description:"Card balance -> DLM Wallet"}],{session});
+    });
+    return res.json({success:true,message:`$${value.toFixed(2)} USD retounen nan DLM Wallet ou.`,walletBalance:Number(result.balance||0),cardBalance:Number(result.cardBalance||0)});
+  }catch(e){console.error("CARD_UNFUND_ERROR:",e);return res.status(e.statusCode||500).json({success:false,message:e.message||"Pa rive retounen lajan nan wallet la."})}
+  finally{session.endSession()}
 });
 
 app.post("/card/request", requireAuth, async (req, res) => {
