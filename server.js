@@ -104,11 +104,6 @@ const userSchema = new mongoose.Schema(
       default: 0,
       min: 0
     },
-    cardBalance: {
-      type: Number,
-      default: 0,
-      min: 0
-    },
     role: {
       type: String,
       enum: ["customer", "admin"],
@@ -161,6 +156,18 @@ const userSchema = new mongoose.Schema(
     passwordResetRequestedAt: {
       type: Date,
       default: null
+    },
+    pinResetTokenHash: {
+      type: String,
+      default: null
+    },
+    pinResetExpiresAt: {
+      type: Date,
+      default: null
+    },
+    pinResetRequestedAt: {
+      type: Date,
+      default: null
     }
   },
   { timestamps: true }
@@ -182,9 +189,7 @@ const transactionSchema = new mongoose.Schema(
         "admin_credit",
         "admin_debit",
         "topup",
-        "giftcard",
-        "card_fund",
-        "card_unfund"
+        "giftcard"
       ],
       required: true
     },
@@ -515,7 +520,6 @@ function publicUser(user) {
     phone: user.phone,
     email: user.email,
     balance: Number(user.balance || 0),
-    cardBalance: Number(user.cardBalance || 0),
     role: user.role,
     status: user.status,
     pinEnabled: Boolean(user.pinEnabled),
@@ -743,6 +747,63 @@ async function requirePinUnlock(req, res, next) {
       message: "PIN session lan ekspire."
     });
   }
+}
+
+
+async function sendPinResetEmail(user, rawToken) {
+  const apiKey = String(
+    process.env.RESEND_API_KEY || ""
+  ).trim();
+
+  const from = String(
+    process.env.PASSWORD_RESET_FROM ||
+    "DLM Wallet <security@dlmwallet.com>"
+  ).trim();
+
+  if (!apiKey) {
+    throw new Error("PASSWORD_EMAIL_NOT_CONFIGURED");
+  }
+
+  const resetUrl =
+    `${String(
+      process.env.FRONTEND_ORIGIN ||
+      "https://dlmwallet.com"
+    ).replace(/\/$/, "")}` +
+    `/reset-pin.html?token=${encodeURIComponent(rawToken)}`;
+
+  const response = await fetch(
+    "https://api.resend.com/emails",
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+        "User-Agent": "DLM-Wallet/1.0"
+      },
+      body: JSON.stringify({
+        from,
+        to: [user.email],
+        subject: "Reset your DLM Wallet PIN",
+        html:
+          `<div style="font-family:Arial,sans-serif;line-height:1.6">` +
+          `<h2>DLM Wallet Security</h2>` +
+          `<p>Nou resevwa yon demann pou reset PIN DLM Wallet ou.</p>` +
+          `<p><a href="${resetUrl}">Reset PIN</a></p>` +
+          `<p>Lyen sa ap ekspire nan 15 minit.</p>` +
+          `<p>Si se pa ou ki mande sa, inyore imel sa.</p>` +
+          `</div>`
+      })
+    }
+  );
+
+  if (!response.ok) {
+    const details = await response.text().catch(() => "");
+    throw new Error(
+      `PIN_RESET_EMAIL_FAILED ${response.status} ${details}`
+    );
+  }
+
+  return true;
 }
 
 async function sendPasswordResetEmail(user, rawToken) {
@@ -2882,9 +2943,15 @@ app.post(
           });
       }
 
+      user.pinFailedAttempts = 0;
+      user.pinLockedUntil = null;
+
+      await user.save();
+
       return res.json({
         success: true,
-        message: "PIN verifye."
+        message: "Kont debloke.",
+        pinToken: createPinToken(user)
       });
     } catch {
       return res
@@ -6062,7 +6129,7 @@ app.patch("/admin/kyc/:id", requireAuth, requireAdmin, async (req, res) => {
 app.get("/card/status", requireAuth, async (req, res) => {
   try {
     const [user, kyc, cardRequest] = await Promise.all([
-      User.findById(req.user.userId).select("balance cardBalance"),
+      User.findById(req.user.userId).select("balance"),
       KycProfile.findOne({ userId: req.user.userId }).select("status"),
       VirtualCardRequest.findOne({ userId: req.user.userId }).sort({ createdAt: -1 })
     ]);
@@ -6070,8 +6137,6 @@ app.get("/card/status", requireAuth, async (req, res) => {
     return res.json({
       success: true,
       balance: Number(user?.balance || 0),
-      walletBalance: Number(user?.balance || 0),
-      cardBalance: Number(user?.cardBalance || 0),
       minimumBalance: 10,
       kycStatus: kyc?.status || "not_submitted",
       cardRequest: cardRequest || null
@@ -6079,42 +6144,6 @@ app.get("/card/status", requireAuth, async (req, res) => {
   } catch {
     return res.status(500).json({ success: false, message: "Pa rive chaje status kat la." });
   }
-});
-
-
-/* =========================
-   CARD BALANCE - INTERNAL DLM LEDGER
-========================= */
-app.post("/card/fund", requireAuth, requirePinUnlock, async (req,res)=>{
-  const session=await mongoose.startSession();
-  try{
-    const amount=Number(req.body.amount);
-    if(!Number.isFinite(amount)||amount<=0) return res.status(400).json({success:false,message:"Montan an pa valab."});
-    const value=Number(amount.toFixed(2)); let result=null;
-    await session.withTransaction(async()=>{
-      result=await User.findOneAndUpdate({_id:req.user.userId,status:"Active",balance:{$gte:value}},{$inc:{balance:-value,cardBalance:value}},{new:true,session});
-      if(!result){const e=new Error("Balans DLM Wallet ou pa sifi.");e.statusCode=400;throw e}
-      await Transaction.create([{userId:result._id,type:"card_fund",amount:value,status:"completed",description:"DLM Wallet -> Card balance"}],{session});
-    });
-    return res.json({success:true,message:`$${value.toFixed(2)} USD mete sou Card balance ou.`,walletBalance:Number(result.balance||0),cardBalance:Number(result.cardBalance||0)});
-  }catch(e){console.error("CARD_FUND_ERROR:",e);return res.status(e.statusCode||500).json({success:false,message:e.message||"Pa rive mete lajan sou kat la."})}
-  finally{session.endSession()}
-});
-
-app.post("/card/unfund", requireAuth, requirePinUnlock, async (req,res)=>{
-  const session=await mongoose.startSession();
-  try{
-    const amount=Number(req.body.amount);
-    if(!Number.isFinite(amount)||amount<=0) return res.status(400).json({success:false,message:"Montan an pa valab."});
-    const value=Number(amount.toFixed(2)); let result=null;
-    await session.withTransaction(async()=>{
-      result=await User.findOneAndUpdate({_id:req.user.userId,status:"Active",cardBalance:{$gte:value}},{$inc:{cardBalance:-value,balance:value}},{new:true,session});
-      if(!result){const e=new Error("Card balance ou pa sifi.");e.statusCode=400;throw e}
-      await Transaction.create([{userId:result._id,type:"card_unfund",amount:value,status:"completed",description:"Card balance -> DLM Wallet"}],{session});
-    });
-    return res.json({success:true,message:`$${value.toFixed(2)} USD retounen nan DLM Wallet ou.`,walletBalance:Number(result.balance||0),cardBalance:Number(result.cardBalance||0)});
-  }catch(e){console.error("CARD_UNFUND_ERROR:",e);return res.status(e.statusCode||500).json({success:false,message:e.message||"Pa rive retounen lajan nan wallet la."})}
-  finally{session.endSession()}
 });
 
 app.post("/card/request", requireAuth, async (req, res) => {
@@ -6587,6 +6616,183 @@ app.post(
       return res.status(500).json({
         success: false,
         message: "Pa rive reset PIN lan."
+      });
+    }
+  }
+);
+
+
+/* =========================
+   PIN RESET BY EMAIL
+========================= */
+
+app.post(
+  "/pin/forgot",
+  requireAuth,
+  async (req, res) => {
+    const genericMessage =
+      "Si imel kont lan valab, nou voye yon lyen pou reset PIN lan.";
+
+    try {
+      const user = await User.findById(
+        req.user.userId
+      );
+
+      if (!user) {
+        return res.json({
+          success: true,
+          message: genericMessage
+        });
+      }
+
+      if (
+        user.pinResetRequestedAt &&
+        Date.now() -
+          new Date(user.pinResetRequestedAt).getTime() <
+          60 * 1000
+      ) {
+        return res.json({
+          success: true,
+          message: genericMessage
+        });
+      }
+
+      const rawToken =
+        crypto.randomBytes(32).toString("hex");
+
+      const hash =
+        crypto.createHash("sha256")
+          .update(rawToken)
+          .digest("hex");
+
+      user.pinResetTokenHash = hash;
+      user.pinResetExpiresAt =
+        new Date(Date.now() + 15 * 60 * 1000);
+      user.pinResetRequestedAt = new Date();
+
+      await user.save();
+
+      try {
+        await sendPinResetEmail(
+          user,
+          rawToken
+        );
+      } catch (error) {
+        console.error(
+          "PIN_RESET_EMAIL_ERROR:",
+          error.message
+        );
+
+        if (
+          error.message ===
+          "PASSWORD_EMAIL_NOT_CONFIGURED"
+        ) {
+          return res.status(503).json({
+            success: false,
+            message:
+              "Email sekirite a poko configure sou server la."
+          });
+        }
+
+        return res.status(502).json({
+          success: false,
+          message:
+            "Pa rive voye email reset PIN lan."
+        });
+      }
+
+      return res.json({
+        success: true,
+        message: genericMessage
+      });
+    } catch (error) {
+      console.error("PIN_FORGOT_ERROR:", error);
+
+      return res.status(500).json({
+        success: false,
+        message:
+          "Pa rive prepare reset PIN lan."
+      });
+    }
+  }
+);
+
+app.post(
+  "/pin/reset-email",
+  async (req, res) => {
+    try {
+      const token = String(
+        req.body.token || ""
+      ).trim();
+
+      const newPin = String(
+        req.body.newPin || ""
+      ).trim();
+
+      const pinCheck = validatePin(newPin);
+
+      if (!pinCheck.ok) {
+        return res.status(400).json({
+          success: false,
+          message: pinCheck.message
+        });
+      }
+
+      if (!token) {
+        return res.status(400).json({
+          success: false,
+          message: "Reset token manke."
+        });
+      }
+
+      const hash =
+        crypto.createHash("sha256")
+          .update(token)
+          .digest("hex");
+
+      const user = await User.findOne({
+        pinResetTokenHash: hash,
+        pinResetExpiresAt: {
+          $gt: new Date()
+        }
+      });
+
+      if (!user) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Lyen reset PIN lan pa valab oswa li ekspire."
+        });
+      }
+
+      user.pinHash =
+        await bcrypt.hash(newPin, 12);
+
+      user.pinEnabled = true;
+      user.pinUpdatedAt = new Date();
+      user.pinFailedAttempts = 0;
+      user.pinLockedUntil = null;
+      user.pinVersion =
+        Number(user.pinVersion || 0) + 1;
+
+      user.pinResetTokenHash = null;
+      user.pinResetExpiresAt = null;
+      user.pinResetRequestedAt = null;
+
+      await user.save();
+
+      return res.json({
+        success: true,
+        message:
+          "PIN ou reset avèk siksè. Retounen sou DLM Wallet epi antre nouvo PIN lan."
+      });
+    } catch (error) {
+      console.error("PIN_EMAIL_RESET_ERROR:", error);
+
+      return res.status(500).json({
+        success: false,
+        message:
+          "Pa rive reset PIN lan."
       });
     }
   }
