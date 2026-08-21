@@ -2497,6 +2497,23 @@ app.get(
 );
 
 
+
+app.get(
+  "/security/email-status",
+  requireAuth,
+  async (_req, res) => {
+    return res.json({
+      success: true,
+      configured: Boolean(
+        String(process.env.RESEND_API_KEY || "").trim()
+      ),
+      senderConfigured: Boolean(
+        String(process.env.PASSWORD_RESET_FROM || "").trim()
+      )
+    });
+  }
+);
+
 /* =========================
    PUBLIC
 ========================= */
@@ -2897,7 +2914,7 @@ app.post(
 );
 
 app.post(
-  "/pin/verify",
+  "/pin/verify-legacy-disabled",
   requireAuth,
   async (req, res) => {
     try {
@@ -6855,7 +6872,7 @@ app.post(
           return res.status(503).json({
             success: false,
             message:
-              "Email sekirite a poko configure sou server la."
+              "Email sekirite a poko configure sou server la. Mete RESEND_API_KEY ak PASSWORD_RESET_FROM nan Render Environment."
           });
         }
 
