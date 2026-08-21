@@ -6092,10 +6092,6 @@ app.post("/card/fund", requireAuth, requirePinUnlock, async (req,res)=>{
     if(!Number.isFinite(amount)||amount<=0) return res.status(400).json({success:false,message:"Montan an pa valab."});
     const value=Number(amount.toFixed(2)); let result=null;
     await session.withTransaction(async()=>{
-      const kyc=await KycProfile.findOne({userId:req.user.userId}).session(session);
-      if(!kyc||kyc.status!=="verified"){const e=new Error("KYC dwe verifye anvan ou mete lajan sou kat la.");e.statusCode=403;throw e}
-      const approved=await VirtualCardRequest.findOne({userId:req.user.userId,status:"approved"}).sort({createdAt:-1}).session(session);
-      if(!approved){const e=new Error("Kat la dwe apwouve anvan ou kapab mete lajan sou li.");e.statusCode=403;throw e}
       result=await User.findOneAndUpdate({_id:req.user.userId,status:"Active",balance:{$gte:value}},{$inc:{balance:-value,cardBalance:value}},{new:true,session});
       if(!result){const e=new Error("Balans DLM Wallet ou pa sifi.");e.statusCode=400;throw e}
       await Transaction.create([{userId:result._id,type:"card_fund",amount:value,status:"completed",description:"DLM Wallet -> Card balance"}],{session});
